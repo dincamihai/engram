@@ -271,6 +271,100 @@ impl Tree {
         Ok(affected > 0)
     }
 
+    /// Forget (delete) all entries whose source matches a SQL LIKE pattern.
+    /// Returns the number of entries deleted.
+    pub fn forget_by_source(&self, pattern: &str) -> Result<usize, String> {
+        let affected = self
+            .conn
+            .execute(
+                "DELETE FROM entries WHERE source LIKE ?1",
+                params![pattern],
+            )
+            .map_err(|e| format!("delete by source: {e}"))?;
+        Ok(affected)
+    }
+
+    /// Delete leaf nodes that have no entries, then recurse up to prune empty parents.
+    fn prune_empty_leaves(&self) -> Result<usize, String> {
+        let mut pruned = 0;
+        loop {
+            // Find nodes with no entries and no children (true leaves), excluding root
+            let empty: Vec<i64> = self
+                .conn
+                .prepare(
+                    "SELECT n.id FROM nodes n
+                     WHERE n.parent_id IS NOT NULL
+                       AND NOT EXISTS (SELECT 1 FROM entries e WHERE e.node_id = n.id)
+                       AND NOT EXISTS (SELECT 1 FROM nodes c WHERE c.parent_id = n.id)",
+                )
+                .map_err(|e| format!("find empty: {e}"))?
+                .query_map([], |row| row.get(0))
+                .map_err(|e| format!("query empty: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            if empty.is_empty() {
+                break;
+            }
+            for id in &empty {
+                self.conn
+                    .execute("DELETE FROM nodes WHERE id = ?1", params![id])
+                    .map_err(|e| format!("prune node: {e}"))?;
+                pruned += 1;
+            }
+        }
+        Ok(pruned)
+    }
+
+    /// Rebuild the tree from scratch: extract all entries, drop nodes, re-insert.
+    pub fn rebuild(&self) -> Result<String, String> {
+        // 1. Extract all entries
+        let mut stmt = self
+            .conn
+            .prepare("SELECT content, embedding, source, created_at FROM entries ORDER BY id")
+            .map_err(|e| format!("prepare extract: {e}"))?;
+        let entries: Vec<(String, Vec<u8>, Option<String>, String)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| format!("query entries: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let count = entries.len();
+        if count == 0 {
+            return Ok("nothing to rebuild".into());
+        }
+
+        // 2. Nuke everything
+        self.conn
+            .execute_batch("DELETE FROM entries; DELETE FROM nodes;")
+            .map_err(|e| format!("clear tables: {e}"))?;
+
+        // 3. Re-create root
+        self.ensure_root()?;
+
+        // 4. Re-insert each entry through the normal store path
+        let dim = self.dimension;
+        for (content, emb_bytes, source, _created_at) in &entries {
+            let embedding: Vec<f32> = emb_bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            if embedding.len() != dim {
+                continue;
+            }
+            self.store(content, &embedding, source.as_deref())?;
+        }
+
+        Ok(format!("rebuilt tree with {count} entries"))
+    }
+
     /// Spreading activation: rehearse memories near the seed, with stochastic noise.
     /// Returns the number of entries activated.
     pub fn replay(&self, seed_embedding: &[f32], noise: f32, count: usize) -> Result<usize, String> {
@@ -355,12 +449,15 @@ impl Tree {
         self.conn.execute_batch(sql).map_err(|e| format!("exec: {e}"))
     }
 
-    /// Rebalance the tree: consolidate faded memories, merge small clusters, re-label.
+    /// Rebalance the tree: prune ghost nodes, consolidate faded memories, merge small clusters, re-label.
     pub fn rebalance(&self) -> Result<String, String> {
         let mut merged = 0;
         let mut relabeled = 0;
         let temporal_degraded = self.degrade_temporal_epochs()?;
         let consolidated = self.consolidate_faded()?;
+
+        // Prune empty leaf nodes left behind by forget/decay
+        let pruned = self.prune_empty_leaves()?;
 
         // Merge leaves with fewer than 3 entries into their nearest sibling
         let small_leaves = self.find_small_leaves(3)?;
@@ -379,6 +476,9 @@ impl Tree {
         }
 
         let mut msg = format!("merged {merged} small clusters, relabeled {relabeled} nodes");
+        if pruned > 0 {
+            msg = format!("pruned {pruned} empty nodes, {msg}");
+        }
         if temporal_degraded > 0 {
             msg = format!("degraded {temporal_degraded} timestamps, {msg}");
         }

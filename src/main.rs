@@ -38,8 +38,18 @@ enum Commands {
     Topics,
     /// Show stats
     Stats,
+    /// Forget (delete) memories by ID or source pattern
+    Forget {
+        /// Memory ID to delete
+        id: Option<i64>,
+        /// Delete all entries whose source matches this pattern (SQL LIKE, e.g. "%SKILL.md")
+        #[arg(long)]
+        source: Option<String>,
+    },
     /// Rebalance clusters
     Rebalance,
+    /// Rebuild tree from scratch (re-cluster all entries)
+    Rebuild,
     /// Ingest files from a directory
     Ingest {
         dir: PathBuf,
@@ -129,12 +139,40 @@ fn main() {
             println!("topics:   {leaf_count}");
         }
 
+        Commands::Forget { id, source } => {
+            let tree = birch::Tree::open(db_str, 768, birch::Config::default())
+                .expect("cannot open tree");
+            if let Some(pattern) = source {
+                match tree.forget_by_source(&pattern) {
+                    Ok(n) => println!("forgot {n} entries matching source \"{pattern}\""),
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            } else if let Some(id) = id {
+                match tree.forget(id) {
+                    Ok(true) => println!("forgot #{id}"),
+                    Ok(false) => println!("#{id} not found"),
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            } else {
+                eprintln!("provide an ID or --source pattern");
+            }
+        }
+
         Commands::Rebalance => {
             let tree = birch::Tree::open(db_str, 768, birch::Config::default())
                 .expect("cannot open tree");
             match tree.rebalance() {
                 Ok(msg) => println!("{msg}"),
                 Err(e) => eprintln!("rebalance error: {e}"),
+            }
+        }
+
+        Commands::Rebuild => {
+            let tree = birch::Tree::open(db_str, 768, birch::Config::default())
+                .expect("cannot open tree");
+            match tree.rebuild() {
+                Ok(msg) => println!("{msg}"),
+                Err(e) => eprintln!("error: {e}"),
             }
         }
 
