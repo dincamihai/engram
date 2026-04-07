@@ -5,6 +5,7 @@ use std::io::{self, BufRead, Write};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::activation::AhaDetector;
 use crate::birch::Tree;
 use crate::embed::Embedder;
 
@@ -43,6 +44,12 @@ impl Response {
 }
 
 pub fn run(tree: Tree, embedder: Embedder) -> Result<(), String> {
+    // Initialize aha detector for automatic spreading activation
+    let aha = AhaDetector::new(&embedder, 0.55);
+    if aha.is_some() {
+        eprintln!("[engram] aha detector ready ({} archetypes)", 8);
+    }
+
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -63,7 +70,7 @@ pub fn run(tree: Tree, embedder: Embedder) -> Result<(), String> {
             }
         };
 
-        let response = handle(&request, &tree, &embedder);
+        let response = handle(&request, &tree, &embedder, aha.as_ref());
         if let Some(resp) = response {
             writeln!(stdout, "{}", serde_json::to_string(&resp).unwrap()).ok();
             stdout.flush().ok();
@@ -73,7 +80,7 @@ pub fn run(tree: Tree, embedder: Embedder) -> Result<(), String> {
     Ok(())
 }
 
-fn handle(req: &Request, tree: &Tree, embedder: &Embedder) -> Option<Response> {
+fn handle(req: &Request, tree: &Tree, embedder: &Embedder, aha: Option<&AhaDetector>) -> Option<Response> {
     match req.method.as_str() {
         "initialize" => Some(Response::success(
             req.id.clone(),
@@ -88,7 +95,7 @@ fn handle(req: &Request, tree: &Tree, embedder: &Embedder) -> Option<Response> {
         "tools/call" => {
             let name = req.params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let args = req.params.get("arguments").cloned().unwrap_or(json!({}));
-            let result = dispatch(name, &args, tree, embedder);
+            let result = dispatch(name, &args, tree, embedder, aha);
             Some(Response::success(
                 req.id.clone(),
                 json!({ "content": [{ "type": "text", "text": result }] }),
@@ -98,7 +105,7 @@ fn handle(req: &Request, tree: &Tree, embedder: &Embedder) -> Option<Response> {
     }
 }
 
-fn dispatch(name: &str, args: &serde_json::Value, tree: &Tree, embedder: &Embedder) -> String {
+fn dispatch(name: &str, args: &serde_json::Value, tree: &Tree, embedder: &Embedder, aha: Option<&AhaDetector>) -> String {
     let result = match name {
         "engram_store" => {
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
@@ -107,11 +114,32 @@ fn dispatch(name: &str, args: &serde_json::Value, tree: &Tree, embedder: &Embedd
             if content.is_empty() {
                 json!({"error": "content is required"})
             } else {
-                match embedder.embed(content) {
-                    Ok(embedding) => match tree.store(content, &embedding, source) {
-                        Ok((id, topic)) => json!({"id": id, "topic": topic}),
-                        Err(e) => json!({"error": e}),
-                    },
+                let dated = format!("{}: {}", chrono::Utc::now().format("%Y-%m-%d"), content);
+                match embedder.embed(&dated) {
+                    Ok(embedding) => {
+                        // Check for aha moment → auto-replay
+                        let aha_triggered = if let Some(detector) = aha {
+                            if let Some(sim) = detector.check(&embedding) {
+                                let activated = tree.replay(&embedding, 0.2, 5).unwrap_or(0);
+                                Some((sim, activated))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        match tree.store(&dated, &embedding, source) {
+                            Ok((id, topic)) => {
+                                let mut result = json!({"id": id, "topic": topic});
+                                if let Some((sim, activated)) = aha_triggered {
+                                    result["aha"] = json!({"similarity": format!("{:.3}", sim), "activated": activated});
+                                }
+                                result
+                            }
+                            Err(e) => json!({"error": e}),
+                        }
+                    }
                     Err(e) => json!({"error": format!("embedding failed: {e}")}),
                 }
             }
@@ -135,7 +163,7 @@ fn dispatch(name: &str, args: &serde_json::Value, tree: &Tree, embedder: &Embedd
                                         "content": e.content,
                                         "source": e.source,
                                         "similarity": format!("{:.3}", e.similarity),
-                                        "created_at": e.created_at,
+                                        "when": e.when,
                                     })
                                 })
                                 .collect();
@@ -165,6 +193,24 @@ fn dispatch(name: &str, args: &serde_json::Value, tree: &Tree, embedder: &Embedd
                     Ok(true) => json!({"forgotten": true}),
                     Ok(false) => json!({"forgotten": false, "reason": "not found"}),
                     Err(e) => json!({"error": e}),
+                }
+            }
+        }
+
+        "engram_replay" => {
+            let context = args.get("context").and_then(|v| v.as_str()).unwrap_or("");
+            let noise = args.get("noise").and_then(|v| v.as_f64()).unwrap_or(0.2) as f32;
+            let count = args.get("count").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+
+            if context.is_empty() {
+                json!({"error": "context is required"})
+            } else {
+                match embedder.embed(context) {
+                    Ok(embedding) => match tree.replay(&embedding, noise, count) {
+                        Ok(activated) => json!({"activated": activated, "noise": noise}),
+                        Err(e) => json!({"error": e}),
+                    },
+                    Err(e) => json!({"error": format!("embedding failed: {e}")}),
                 }
             }
         }
@@ -215,6 +261,19 @@ fn tools() -> Vec<serde_json::Value> {
                     "id": {"type": "integer", "description": "Entry ID to forget"}
                 },
                 "required": ["id"]
+            }
+        }),
+        json!({
+            "name": "engram_replay",
+            "description": "Spreading activation: rehearse memories related to context. Keeps relevant memories alive organically.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "context": {"type": "string", "description": "Current context or topic to activate around"},
+                    "noise": {"type": "number", "description": "Probability of random activation (0-1, default 0.2)"},
+                    "count": {"type": "integer", "description": "Number of memories to activate (default 5)"}
+                },
+                "required": ["context"]
             }
         }),
     ]

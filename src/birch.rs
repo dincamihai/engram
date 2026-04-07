@@ -34,20 +34,17 @@ pub struct Entry {
     pub content: String,
     pub source: Option<String>,
     pub created_at: String,
-    pub node_id: i64,
+    pub when: String,
     pub similarity: f32,
 }
 
 /// A cluster node in the tree.
 #[derive(Debug, Clone)]
 pub struct Node {
-    pub id: i64,
     pub parent_id: Option<i64>,
     pub centroid: Vec<f32>,
     pub count: i64,
-    pub radius: f32,
     pub label: String,
-    pub depth: i32,
 }
 
 /// Summary of a topic (cluster) for browsing.
@@ -91,7 +88,10 @@ impl Tree {
                 content TEXT NOT NULL,
                 embedding BLOB NOT NULL,
                 source TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                access_count INTEGER DEFAULT 0,
+                last_accessed TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                epoch INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_entries_node ON entries(node_id);",
         )
@@ -125,11 +125,26 @@ impl Tree {
         // Find the best leaf node for this embedding
         let (node_id, label) = self.find_or_create_leaf(embedding)?;
 
+        // Dedup: skip if identical content already exists in this leaf
+        let exists: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM entries WHERE node_id = ?1 AND content = ?2",
+                params![node_id, content],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("dedup check: {e}"))?;
+
+        if exists {
+            return Ok((-1, label));
+        }
+
         // Insert the entry
+        let epoch = chrono::Utc::now().timestamp();
         self.conn
             .execute(
-                "INSERT INTO entries (node_id, content, embedding, source) VALUES (?1, ?2, ?3, ?4)",
-                params![node_id, content, centroid_to_blob(embedding), source],
+                "INSERT INTO entries (node_id, content, embedding, source, epoch) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![node_id, content, centroid_to_blob(embedding), source, epoch],
             )
             .map_err(|e| format!("insert entry: {e}"))?;
 
@@ -140,33 +155,69 @@ impl Tree {
 
         // Check if leaf needs splitting
         let count = self.node_entry_count(node_id)?;
-        if count > self.config.leaf_capacity as i64 {
+        let was_split = if count > self.config.leaf_capacity as i64 {
             self.split_leaf(node_id)?;
+            true
+        } else {
+            false
+        };
+
+        // Check if any siblings should merge (skip if node was just split/deleted)
+        if !was_split {
+            self.try_merge_siblings(node_id)?;
         }
 
         Ok((entry_id, label))
     }
 
     /// Search for the top-k most similar entries to a query embedding.
+    /// Applies time decay: older, unaccessed memories score lower.
     pub fn search(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<Entry>, String> {
-        // Brute-force cosine similarity over all entries.
-        // Fine for <10k entries. For larger scale, traverse tree to prune.
+        let now = chrono::Utc::now();
+
         let mut stmt = self
             .conn
-            .prepare("SELECT id, node_id, content, embedding, source, created_at FROM entries")
+            .prepare(
+                "SELECT id, node_id, content, embedding, source, created_at, access_count, last_accessed, epoch FROM entries",
+            )
             .map_err(|e| format!("prepare search: {e}"))?;
 
         let mut scored: Vec<(f32, Entry)> = stmt
             .query_map([], |row| {
                 let id: i64 = row.get(0)?;
-                let node_id: i64 = row.get(1)?;
+                let _node_id: i64 = row.get(1)?;
                 let content: String = row.get(2)?;
                 let blob: Vec<u8> = row.get(3)?;
                 let source: Option<String> = row.get(4)?;
                 let created_at: String = row.get(5)?;
+                let access_count: i64 = row.get(6)?;
+                let last_accessed: Option<String> = row.get(7)?;
+                let epoch: Option<i64> = row.get(8)?;
+
                 let embedding = blob_to_centroid(&blob);
-                let sim = cosine_similarity(query_embedding, &embedding);
-                Ok((sim, Entry { id, content, source, created_at, node_id, similarity: sim }))
+                let raw_sim = cosine_similarity(query_embedding, &embedding);
+
+                // Decay: reduce score based on days since last access (or creation)
+                let ref_date = last_accessed.as_deref().unwrap_or(&created_at);
+                let days_ago = chrono::DateTime::parse_from_rfc3339(ref_date)
+                    .map(|dt| (now - dt.to_utc()).num_days().max(0) as f32)
+                    .unwrap_or(0.0);
+
+                // Weibull decay: k=0.5 means fast initial decay, survivors stabilize
+                let k: f32 = 0.5;
+                let lambda: f32 = 30.0;
+                let decay = (-(days_ago / lambda).powf(k)).exp();
+
+                // Access boost: each retrieval "rehearses" the memory, resisting decay
+                let access_boost = (access_count as f32).ln_1p() * 0.03;
+                let score = raw_sim * (0.7 + 0.3 * decay) + access_boost;
+
+                // Fuzzy timestamp: precision decays with retention
+                let when = epoch
+                    .map(|e| fuzzy_date(e, decay))
+                    .unwrap_or_else(|| created_at.clone());
+
+                Ok((score, Entry { id, content, source, created_at, when, similarity: score }))
             })
             .map_err(|e| format!("search query: {e}"))?
             .filter_map(|r| r.ok())
@@ -174,6 +225,19 @@ impl Tree {
 
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(limit);
+
+        // Update access stats for returned results
+        let ids: Vec<i64> = scored.iter().map(|(_, e)| e.id).collect();
+        let now_str = now.to_rfc3339();
+        for id in &ids {
+            self.conn
+                .execute(
+                    "UPDATE entries SET access_count = access_count + 1, last_accessed = ?1 WHERE id = ?2",
+                    params![now_str, id],
+                )
+                .ok();
+        }
+
         Ok(scored.into_iter().map(|(_, e)| e).collect())
     }
 
@@ -192,6 +256,78 @@ impl Tree {
         Ok(affected > 0)
     }
 
+    /// Spreading activation: rehearse memories near the seed, with stochastic noise.
+    /// Returns the number of entries activated.
+    pub fn replay(&self, seed_embedding: &[f32], noise: f32, count: usize) -> Result<usize, String> {
+        let total = self.count()?;
+        if total == 0 {
+            return Ok(0);
+        }
+
+        let now_str = chrono::Utc::now().to_rfc3339();
+        let mut activated = 0;
+
+        // Collect all entries with embeddings
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, embedding FROM entries")
+            .map_err(|e| format!("prepare replay: {e}"))?;
+
+        let entries: Vec<(i64, Vec<f32>)> = stmt
+            .query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                Ok((id, blob_to_centroid(&blob)))
+            })
+            .map_err(|e| format!("query replay: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        // Score all entries by similarity to seed
+        let mut scored: Vec<(f32, i64)> = entries
+            .iter()
+            .map(|(id, emb)| (cosine_similarity(seed_embedding, emb), *id))
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Simple deterministic RNG seeded from the embedding
+        let mut rng_state: u64 = seed_embedding
+            .iter()
+            .fold(0u64, |acc, &v| acc.wrapping_add((v * 1e6) as u64));
+
+        for _ in 0..count.min(entries.len()) {
+            // Cheap xorshift RNG
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            let rand_val = (rng_state % 1000) as f32 / 1000.0;
+
+            let id = if rand_val < noise {
+                // Random entry (exploration)
+                let idx = (rng_state as usize) % entries.len();
+                entries[idx].0
+            } else {
+                // Nearest entry (exploitation)
+                let idx = activated.min(scored.len() - 1);
+                scored[idx].1
+            };
+
+            self.conn
+                .execute(
+                    "UPDATE entries SET access_count = access_count + 1, last_accessed = ?1 WHERE id = ?2",
+                    params![now_str, id],
+                )
+                .ok();
+            activated += 1;
+        }
+
+        Ok(activated)
+    }
+
     /// Total number of stored entries.
     pub fn count(&self) -> Result<i64, String> {
         self.conn
@@ -199,10 +335,16 @@ impl Tree {
             .map_err(|e| format!("count: {e}"))
     }
 
-    /// Rebalance the tree: merge small clusters, re-label.
+    /// Execute raw SQL (for testing — manipulate timestamps, access counts, etc.)
+    pub fn conn_exec(&self, sql: &str) -> Result<(), String> {
+        self.conn.execute_batch(sql).map_err(|e| format!("exec: {e}"))
+    }
+
+    /// Rebalance the tree: consolidate faded memories, merge small clusters, re-label.
     pub fn rebalance(&self) -> Result<String, String> {
         let mut merged = 0;
         let mut relabeled = 0;
+        let consolidated = self.consolidate_faded()?;
 
         // Merge leaves with fewer than 3 entries into their nearest sibling
         let small_leaves = self.find_small_leaves(3)?;
@@ -220,7 +362,142 @@ impl Tree {
             }
         }
 
-        Ok(format!("merged {merged} small clusters, relabeled {relabeled} nodes"))
+        let mut msg = format!("merged {merged} small clusters, relabeled {relabeled} nodes");
+        if consolidated > 0 {
+            msg = format!("consolidated {consolidated} faded memories, {msg}");
+        }
+        Ok(msg)
+    }
+
+    /// Consolidate faded memories: group old unaccessed entries by cluster,
+    /// merge each group into a single condensed entry.
+    fn consolidate_faded(&self) -> Result<usize, String> {
+        let now = chrono::Utc::now();
+        let k: f32 = 0.5;
+        let lambda: f32 = 30.0;
+        let retention_threshold: f32 = 0.15; // consolidate below this retention
+        let min_group_size = 3; // need at least 3 faded entries to consolidate
+
+        // Find all entries with low retention and no access
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, node_id, content, embedding, created_at FROM entries
+                 WHERE access_count = 0",
+            )
+            .map_err(|e| format!("prepare consolidate: {e}"))?;
+
+        let candidates: Vec<(i64, i64, String, Vec<f32>, String)> = stmt
+            .query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                let node_id: i64 = row.get(1)?;
+                let content: String = row.get(2)?;
+                let blob: Vec<u8> = row.get(3)?;
+                let created_at: String = row.get(4)?;
+                Ok((id, node_id, content, blob_to_centroid(&blob), created_at))
+            })
+            .map_err(|e| format!("query consolidate: {e}"))?
+            .filter_map(|r| r.ok())
+            .filter(|(_, _, _, _, created_at)| {
+                let days_ago = chrono::DateTime::parse_from_rfc3339(created_at)
+                    .map(|dt| (now - dt.to_utc()).num_days().max(0) as f32)
+                    .unwrap_or(0.0);
+                let retention = (-(days_ago / lambda).powf(k)).exp();
+                retention < retention_threshold
+            })
+            .collect();
+
+        // Group by node_id
+        let mut groups: std::collections::HashMap<i64, Vec<(i64, String, Vec<f32>, String)>> =
+            std::collections::HashMap::new();
+        for (id, node_id, content, embedding, created_at) in candidates {
+            groups.entry(node_id).or_default().push((id, content, embedding, created_at));
+        }
+
+        let mut total_consolidated = 0;
+
+        for (node_id, entries) in &groups {
+            if entries.len() < min_group_size {
+                continue;
+            }
+
+            // Find the date range of the faded memories
+            let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
+            let mut latest: Option<chrono::DateTime<chrono::Utc>> = None;
+            for (_, _, _, created_at) in entries {
+                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(created_at) {
+                    let dt = dt.to_utc();
+                    earliest = Some(earliest.map_or(dt, |e: chrono::DateTime<chrono::Utc>| e.min(dt)));
+                    latest = Some(latest.map_or(dt, |l: chrono::DateTime<chrono::Utc>| l.max(dt)));
+                }
+            }
+
+            // Fuzzy date range for the consolidated entry
+            let date_prefix = match (earliest, latest) {
+                (Some(e), Some(l)) => {
+                    let e_fuzzy = fuzzy_date(e.timestamp(), retention_threshold);
+                    let l_fuzzy = fuzzy_date(l.timestamp(), retention_threshold);
+                    if e_fuzzy == l_fuzzy {
+                        e_fuzzy
+                    } else {
+                        format!("{}..{}", e_fuzzy, l_fuzzy)
+                    }
+                }
+                _ => "long ago".to_string(),
+            };
+
+            // Concatenate contents, average embeddings
+            let combined_content: String = entries
+                .iter()
+                .map(|(_, c, _, _)| c.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let combined_content = format!("{}: {}", date_prefix, combined_content);
+
+            // Truncate to keep it reasonable
+            let condensed = if combined_content.len() > 2000 {
+                let end = combined_content.char_indices()
+                    .nth(2000)
+                    .map(|(i, _)| i)
+                    .unwrap_or(combined_content.len());
+                &combined_content[..end]
+            } else {
+                &combined_content
+            };
+
+            // Average embedding
+            let dim = entries[0].2.len();
+            let mut avg = vec![0.0f32; dim];
+            for (_, _, emb, _) in entries {
+                for (i, v) in emb.iter().enumerate() {
+                    avg[i] += v;
+                }
+            }
+            let n = entries.len() as f32;
+            for v in &mut avg {
+                *v /= n;
+            }
+
+            // Insert consolidated entry
+            let epoch = earliest.map(|e| e.timestamp()).unwrap_or_else(|| now.timestamp());
+            self.conn
+                .execute(
+                    "INSERT INTO entries (node_id, content, embedding, source, epoch) VALUES (?1, ?2, ?3, 'consolidated', ?4)",
+                    params![node_id, condensed, centroid_to_blob(&avg), epoch],
+                )
+                .map_err(|e| format!("insert consolidated: {e}"))?;
+
+            // Delete originals
+            for (id, _, _, _) in entries {
+                self.conn
+                    .execute("DELETE FROM entries WHERE id = ?1", params![id])
+                    .ok();
+            }
+
+            total_consolidated += entries.len();
+        }
+
+        Ok(total_consolidated)
     }
 
     // --- Internal methods ---
@@ -474,13 +751,10 @@ impl Tree {
                 params![node_id],
                 |row| {
                     Ok(Node {
-                        id: row.get(0)?,
                         parent_id: row.get(1)?,
                         centroid: blob_to_centroid(&row.get::<_, Vec<u8>>(2)?),
                         count: row.get(3)?,
-                        radius: row.get(4)?,
                         label: row.get(5)?,
-                        depth: row.get(6)?,
                     })
                 },
             )
@@ -526,6 +800,72 @@ impl Tree {
             .collect();
 
         Ok(ids)
+    }
+
+    /// After an insert, check if this node's parent has two siblings close enough to merge.
+    fn try_merge_siblings(&self, node_id: i64) -> Result<(), String> {
+        let node = self.get_node(node_id)?;
+        let parent_id = match node.parent_id {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        // Get all siblings under the same parent
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, centroid FROM nodes WHERE parent_id = ?1")
+            .map_err(|e| format!("prepare siblings: {e}"))?;
+
+        let siblings: Vec<(i64, Vec<f32>)> = stmt
+            .query_map(params![parent_id], |row| {
+                let id: i64 = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                Ok((id, blob_to_centroid(&blob)))
+            })
+            .map_err(|e| format!("query siblings: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if siblings.len() < 2 {
+            return Ok(());
+        }
+
+        // Find the most similar pair
+        let merge_threshold = self.config.threshold + 0.15; // merge when clearly same topic
+        let mut best_sim = f32::NEG_INFINITY;
+        let mut merge_a = 0i64;
+        let mut merge_b = 0i64;
+
+        for i in 0..siblings.len() {
+            for j in (i + 1)..siblings.len() {
+                let sim = cosine_similarity(&siblings[i].1, &siblings[j].1);
+                if sim > best_sim {
+                    best_sim = sim;
+                    merge_a = siblings[i].0;
+                    merge_b = siblings[j].0;
+                }
+            }
+        }
+
+        if best_sim >= merge_threshold {
+            // Merge b into a
+            self.conn
+                .execute(
+                    "UPDATE entries SET node_id = ?1 WHERE node_id = ?2",
+                    params![merge_a, merge_b],
+                )
+                .map_err(|e| format!("merge entries: {e}"))?;
+
+            self.recompute_centroid(merge_a)?;
+
+            self.conn
+                .execute("DELETE FROM nodes WHERE id = ?1", params![merge_b])
+                .map_err(|e| format!("delete merged: {e}"))?;
+
+            let _ = self.auto_label(merge_a);
+        }
+
+        Ok(())
     }
 
     fn merge_into_nearest_sibling(&self, leaf_id: i64) -> Result<bool, String> {
@@ -644,6 +984,26 @@ impl Tree {
 }
 
 // --- Helpers ---
+
+/// Decay a timestamp: lose precision based on Weibull retention.
+/// Recent memories have exact times, old ones become "2025-03" or "long ago".
+pub fn fuzzy_date(epoch: i64, retention: f32) -> String {
+    use chrono::{DateTime, Utc};
+    let dt = DateTime::<Utc>::from_timestamp(epoch, 0)
+        .unwrap_or_else(|| Utc::now());
+
+    if retention > 0.5 {
+        dt.format("%Y-%m-%d %H:%M").to_string()
+    } else if retention > 0.3 {
+        dt.format("%Y-%m-%d").to_string()
+    } else if retention > 0.15 {
+        dt.format("%Y-%m").to_string()
+    } else if retention > 0.05 {
+        dt.format("%Y").to_string()
+    } else {
+        "long ago".to_string()
+    }
+}
 
 fn centroid_to_blob(centroid: &[f32]) -> Vec<u8> {
     centroid.iter().flat_map(|f| f.to_le_bytes()).collect()

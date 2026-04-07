@@ -1,6 +1,6 @@
-mod birch;
-mod embed;
-mod mcp;
+use engram::birch;
+use engram::embed;
+use engram::mcp;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -98,7 +98,7 @@ fn main() {
                 println!("no results for: \"{query}\"");
             } else {
                 for (i, e) in results.iter().enumerate() {
-                    println!("[{}] (sim={:.3}) {}", i + 1, e.similarity, e.created_at);
+                    println!("[{}] (sim={:.3}) {}", i + 1, e.similarity, e.when);
                     if let Some(ref src) = e.source {
                         println!("    source: {src}");
                     }
@@ -177,32 +177,36 @@ fn ingest(dir: &std::path::Path, tree: &birch::Tree, embedder: &embed::Embedder,
             continue;
         }
 
-        let chunks = chunk_text(&content, 2000);
+        // Get file modification date for temporal embedding
+        let file_date = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(|t| {
+                let dt: chrono::DateTime<chrono::Utc> = t.into();
+                dt.format("%Y-%m-%d").to_string()
+            })
+            .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
+
+        let chunks = semantic_chunk(&content, embedder);
         let source = path.to_string_lossy().to_string();
 
-        for chunk in &chunks {
-            // Skip chunks with too little actual text
-            let alpha_count = chunk.chars().filter(|c| c.is_alphanumeric()).count();
-            if alpha_count < 30 {
-                continue;
-            }
-
-            match embedder.embed(chunk) {
-                Ok(embedding) => match tree.store(chunk, &embedding, Some(&source)) {
-                    Ok(_) => {
-                        count += 1;
-                        if count % 10 == 0 {
-                            eprint!("\r  stored {count} entries...");
-                        }
+        for (chunk, _chunk_embedding) in &chunks {
+            let dated = format!("{}: {}", file_date, chunk);
+            let dated_embedding = match embedder.embed(&dated) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            match tree.store(&dated, &dated_embedding, Some(&source)) {
+                Ok(_) => {
+                    count += 1;
+                    if count % 10 == 0 {
+                        eprint!("\r  stored {count} entries...");
                     }
-                    Err(e) => {
-                        errors += 1;
-                        eprintln!("\n  error storing {}: {e}", path.display());
-                    }
-                },
+                }
                 Err(e) => {
                     errors += 1;
-                    eprintln!("\n  embed error {}: {e}", path.display());
+                    eprintln!("\n  error storing {}: {e}", path.display());
                 }
             }
 
@@ -227,26 +231,89 @@ fn ingest(dir: &std::path::Path, tree: &birch::Tree, embedder: &embed::Embedder,
     }
 }
 
-fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
-    if text.len() <= max_chars {
-        return vec![text.to_string()];
+/// Semantic chunking: split text into passages by detecting topic shifts via embedding similarity.
+fn semantic_chunk(text: &str, embedder: &embed::Embedder) -> Vec<(String, Vec<f32>)> {
+    const SIMILARITY_THRESHOLD: f32 = 0.75;
+    const MIN_CHUNK_CHARS: usize = 30;
+
+    // Split into paragraphs (double newline or single newline for short blocks)
+    let paragraphs: Vec<&str> = text
+        .split("\n\n")
+        .flat_map(|block| {
+            // If a block is very large, split on single newlines too
+            if block.len() > 3000 {
+                block.split('\n').collect::<Vec<_>>()
+            } else {
+                vec![block]
+            }
+        })
+        .map(|p| p.trim())
+        .filter(|p| {
+            let alpha = p.chars().filter(|c| c.is_alphanumeric()).count();
+            alpha >= MIN_CHUNK_CHARS
+        })
+        .collect();
+
+    if paragraphs.is_empty() {
+        return Vec::new();
     }
 
-    let mut chunks = Vec::new();
-    let mut start = 0;
+    // Embed each paragraph
+    let mut para_embeddings: Vec<Option<Vec<f32>>> = Vec::with_capacity(paragraphs.len());
+    for p in &paragraphs {
+        para_embeddings.push(embedder.embed(p).ok());
+    }
 
-    while start < text.len() {
-        let end = (start + max_chars).min(text.len());
-        let break_at = text[start..end]
-            .rfind('\n')
-            .map(|i| start + i + 1)
-            .unwrap_or(end);
+    // Group consecutive paragraphs into chunks, splitting at topic boundaries
+    let mut chunks: Vec<(String, Vec<f32>)> = Vec::new();
+    let mut current_paras: Vec<&str> = Vec::new();
+    let mut current_embedding: Option<Vec<f32>> = None;
 
-        let chunk = text[start..break_at].trim();
-        if !chunk.is_empty() {
-            chunks.push(chunk.to_string());
+    for i in 0..paragraphs.len() {
+        let emb = &para_embeddings[i];
+
+        if current_paras.is_empty() {
+            current_paras.push(paragraphs[i]);
+            current_embedding = emb.clone();
+            continue;
         }
-        start = break_at;
+
+        // Check if this paragraph belongs with the current chunk
+        let should_split = match (&current_embedding, emb) {
+            (Some(prev), Some(curr)) => {
+                let sim = embed::cosine_similarity(prev, curr);
+                sim < SIMILARITY_THRESHOLD
+            }
+            _ => false, // if embedding failed, keep grouping
+        };
+
+        // Also split if current chunk is getting too large
+        let current_len: usize = current_paras.iter().map(|p| p.len()).sum();
+        let too_large = current_len > 2000;
+
+        if should_split || too_large {
+            // Flush current chunk
+            let text = current_paras.join("\n\n");
+            if let Some(emb) = current_embedding.take() {
+                chunks.push((text, emb));
+            } else if let Ok(emb) = embedder.embed(&text) {
+                chunks.push((text, emb));
+            }
+            current_paras.clear();
+        }
+
+        current_paras.push(paragraphs[i]);
+        current_embedding = emb.clone();
+    }
+
+    // Flush remaining
+    if !current_paras.is_empty() {
+        let text = current_paras.join("\n\n");
+        if let Some(emb) = current_embedding {
+            chunks.push((text, emb));
+        } else if let Ok(emb) = embedder.embed(&text) {
+            chunks.push((text, emb));
+        }
     }
 
     chunks
