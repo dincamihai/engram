@@ -256,6 +256,117 @@ impl Tree {
         Ok(scored.into_iter().map(|(_, e)| e).collect())
     }
 
+    /// Recall: search and return results as a neighborhood subtree.
+    /// Finds the best matching entries, then returns their clusters with nearby sibling clusters,
+    /// capped at `limit` total entries.
+    pub fn recall(&self, query_embedding: &[f32], limit: usize) -> Result<String, String> {
+        let entries = self.search(query_embedding, limit)?;
+        if entries.is_empty() {
+            return Ok(String::new());
+        }
+
+        // Collect the node_ids for matched entries
+        let matched_node_ids: Vec<i64> = {
+            let ids: Vec<i64> = entries.iter().map(|e| e.id).collect();
+            let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT DISTINCT node_id FROM entries WHERE id IN ({})", placeholders);
+            let mut stmt = self.conn.prepare(&sql).map_err(|e| format!("prepare nodes: {e}"))?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(&ids), |row| row.get::<_, i64>(0))
+                .map_err(|e| format!("query nodes: {e}"))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        // Go up one level: collect siblings, ranked by centroid similarity to query
+        let mut neighborhood: Vec<(f32, i64)> = Vec::new(); // (similarity, node_id)
+        let mut seen = std::collections::HashSet::new();
+
+        for node_id in &matched_node_ids {
+            let parent_id: Option<i64> = self
+                .conn
+                .query_row("SELECT parent_id FROM nodes WHERE id = ?1", params![node_id], |row| row.get(0))
+                .ok()
+                .flatten();
+
+            let siblings = if let Some(pid) = parent_id {
+                let mut stmt = self.conn.prepare("SELECT id, centroid FROM nodes WHERE parent_id = ?1")
+                    .map_err(|e| format!("siblings: {e}"))?;
+                stmt.query_map(params![pid], |row| {
+                    let id: i64 = row.get(0)?;
+                    let blob: Vec<u8> = row.get(1)?;
+                    Ok((id, blob))
+                })
+                .map_err(|e| format!("query siblings: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect::<Vec<_>>()
+            } else {
+                vec![(*node_id, Vec::new())]
+            };
+
+            for (sid, centroid_blob) in siblings {
+                if !seen.insert(sid) {
+                    continue;
+                }
+                let sim = if centroid_blob.is_empty() {
+                    0.0
+                } else {
+                    let centroid = blob_to_centroid(&centroid_blob);
+                    cosine_similarity(query_embedding, &centroid)
+                };
+                // Matched nodes always come first
+                let boost = if matched_node_ids.contains(&sid) { 1.0 } else { 0.0 };
+                neighborhood.push((sim + boost, sid));
+            }
+        }
+
+        neighborhood.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Build output, capping total entries at limit
+        let mut output = String::new();
+        let mut total_entries = 0;
+
+        for (_sim, node_id) in &neighborhood {
+            if total_entries >= limit {
+                break;
+            }
+
+            let label: String = self
+                .conn
+                .query_row("SELECT label FROM nodes WHERE id = ?1", params![node_id], |row| row.get(0))
+                .unwrap_or_else(|_| "~".into());
+
+            let mut stmt = self
+                .conn
+                .prepare("SELECT content FROM entries WHERE node_id = ?1")
+                .map_err(|e| format!("entries: {e}"))?;
+            let cluster_entries: Vec<String> = stmt
+                .query_map(params![node_id], |row| row.get(0))
+                .map_err(|e| format!("query entries: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            if cluster_entries.is_empty() {
+                continue;
+            }
+
+            if !output.is_empty() {
+                output.push_str("\n\n");
+            }
+            output.push_str(&label);
+            output.push(':');
+            for content in &cluster_entries {
+                if total_entries >= limit {
+                    break;
+                }
+                output.push('\n');
+                output.push_str(content);
+                total_entries += 1;
+            }
+        }
+
+        Ok(output)
+    }
+
     /// List topics (cluster nodes) as a tree.
     pub fn topics(&self) -> Result<Vec<Topic>, String> {
         let root_id = self.root_id()?;

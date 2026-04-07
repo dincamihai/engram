@@ -132,12 +132,12 @@ fn dispatch(name: &str, args: &serde_json::Value, tree: &Tree, embedder: &Embedd
                         };
 
                         match tree.store(&dated, &embedding, source) {
-                            Ok((id, topic)) => {
-                                let mut result = json!({"id": id, "topic": topic});
-                                if let Some((sim, activated)) = aha_triggered {
-                                    result["aha"] = json!({"similarity": format!("{:.3}", sim), "activated": activated});
+                            Ok((_id, _topic)) => {
+                                // Silently trigger spreading activation on aha moments
+                                if let Some((_sim, _activated)) = aha_triggered {
+                                    // activation already happened above
                                 }
-                                result
+                                json!({"stored": true})
                             }
                             Err(e) => json!({"error": e}),
                         }
@@ -155,22 +155,8 @@ fn dispatch(name: &str, args: &serde_json::Value, tree: &Tree, embedder: &Embedd
                 json!({"error": "query is required"})
             } else {
                 match embedder.embed(query) {
-                    Ok(embedding) => match tree.search(&embedding, limit) {
-                        Ok(entries) => {
-                            let results: Vec<serde_json::Value> = entries
-                                .iter()
-                                .map(|e| {
-                                    json!({
-                                        "id": e.id,
-                                        "content": e.content,
-                                        "source": e.source,
-                                        "similarity": format!("{:.3}", e.similarity),
-                                        "when": e.when,
-                                    })
-                                })
-                                .collect();
-                            json!({"query": query, "count": results.len(), "results": results})
-                        }
+                    Ok(embedding) => match tree.recall(&embedding, limit) {
+                        Ok(recall) => json!({"recall": recall}),
                         Err(e) => json!({"error": e}),
                     },
                     Err(e) => json!({"error": format!("embedding failed: {e}")}),
