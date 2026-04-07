@@ -91,11 +91,24 @@ impl Tree {
                 access_count INTEGER DEFAULT 0,
                 last_accessed TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                epoch INTEGER
+                epoch INTEGER,
+                temporal_epoch INTEGER,
+                temporal_shift INTEGER DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_entries_node ON entries(node_id);",
         )
         .map_err(|e| format!("create tables: {e}"))?;
+
+        // Migrate: add columns if they don't exist (for existing DBs)
+        for col in &[
+            "ALTER TABLE entries ADD COLUMN temporal_epoch INTEGER",
+            "ALTER TABLE entries ADD COLUMN temporal_shift INTEGER DEFAULT 0",
+        ] {
+            conn.execute_batch(col).ok(); // ignore "duplicate column" errors
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_entries_temporal ON entries(temporal_epoch);",
+        ).ok();
 
         let tree = Self { conn, config, dimension };
         tree.ensure_root()?;
@@ -143,7 +156,7 @@ impl Tree {
         let epoch = chrono::Utc::now().timestamp();
         self.conn
             .execute(
-                "INSERT INTO entries (node_id, content, embedding, source, epoch) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO entries (node_id, content, embedding, source, epoch, temporal_epoch) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
                 params![node_id, content, centroid_to_blob(embedding), source, epoch],
             )
             .map_err(|e| format!("insert entry: {e}"))?;
@@ -178,7 +191,7 @@ impl Tree {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, node_id, content, embedding, source, created_at, access_count, last_accessed, epoch FROM entries",
+                "SELECT id, node_id, content, embedding, source, created_at, access_count, last_accessed, epoch, temporal_epoch, temporal_shift FROM entries",
             )
             .map_err(|e| format!("prepare search: {e}"))?;
 
@@ -192,12 +205,14 @@ impl Tree {
                 let created_at: String = row.get(5)?;
                 let access_count: i64 = row.get(6)?;
                 let last_accessed: Option<String> = row.get(7)?;
-                let epoch: Option<i64> = row.get(8)?;
+                let _epoch: Option<i64> = row.get(8)?;
+                let temporal_epoch: Option<i64> = row.get(9)?;
+                let temporal_shift: u32 = row.get::<_, u32>(10)?;
 
                 let embedding = blob_to_centroid(&blob);
                 let raw_sim = cosine_similarity(query_embedding, &embedding);
 
-                // Decay: reduce score based on days since last access (or creation)
+                // Content decay: based on last access (access count protects content)
                 let ref_date = last_accessed.as_deref().unwrap_or(&created_at);
                 let days_ago = chrono::DateTime::parse_from_rfc3339(ref_date)
                     .map(|dt| (now - dt.to_utc()).num_days().max(0) as f32)
@@ -208,13 +223,13 @@ impl Tree {
                 let lambda: f32 = 30.0;
                 let decay = (-(days_ago / lambda).powf(k)).exp();
 
-                // Access boost: each retrieval "rehearses" the memory, resisting decay
+                // Access boost: each retrieval "rehearses" the memory, resisting content decay
                 let access_boost = (access_count as f32).ln_1p() * 0.03;
                 let score = raw_sim * (0.7 + 0.3 * decay) + access_boost;
 
-                // Fuzzy timestamp: precision decays with retention
-                let when = epoch
-                    .map(|e| fuzzy_date(e, decay))
+                // Fuzzy timestamp: derived from bit-shifted temporal epoch
+                let when = temporal_epoch
+                    .map(|te| fuzzy_date_from_shift(te, temporal_shift))
                     .unwrap_or_else(|| created_at.clone());
 
                 Ok((score, Entry { id, content, source, created_at, when, similarity: score }))
@@ -344,6 +359,7 @@ impl Tree {
     pub fn rebalance(&self) -> Result<String, String> {
         let mut merged = 0;
         let mut relabeled = 0;
+        let temporal_degraded = self.degrade_temporal_epochs()?;
         let consolidated = self.consolidate_faded()?;
 
         // Merge leaves with fewer than 3 entries into their nearest sibling
@@ -363,10 +379,53 @@ impl Tree {
         }
 
         let mut msg = format!("merged {merged} small clusters, relabeled {relabeled} nodes");
+        if temporal_degraded > 0 {
+            msg = format!("degraded {temporal_degraded} timestamps, {msg}");
+        }
         if consolidated > 0 {
             msg = format!("consolidated {consolidated} faded memories, {msg}");
         }
         Ok(msg)
+    }
+
+    /// Degrade temporal_epoch precision based on age (not access count).
+    fn degrade_temporal_epochs(&self) -> Result<usize, String> {
+        let now = chrono::Utc::now();
+        let mut count = 0;
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, epoch, temporal_shift, created_at FROM entries WHERE epoch IS NOT NULL")
+            .map_err(|e| format!("prepare temporal: {e}"))?;
+
+        let entries: Vec<(i64, i64, u32, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get::<_, u32>(2)?, row.get(3)?))
+            })
+            .map_err(|e| format!("query temporal: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for (id, epoch, current_shift, created_at) in &entries {
+            let days_ago = chrono::DateTime::parse_from_rfc3339(created_at)
+                .map(|dt| (now - dt.to_utc()).num_days().max(0) as f32)
+                .unwrap_or(0.0);
+
+            let new_shift = temporal_shift_for_age(days_ago);
+
+            if new_shift > *current_shift {
+                let new_temporal = epoch >> new_shift;
+                self.conn
+                    .execute(
+                        "UPDATE entries SET temporal_epoch = ?1, temporal_shift = ?2 WHERE id = ?3",
+                        params![new_temporal, new_shift, id],
+                    )
+                    .map_err(|e| format!("update temporal: {e}"))?;
+                count += 1;
+            }
+        }
+
+        Ok(count)
     }
 
     /// Consolidate faded memories: group old unaccessed entries by cluster,
@@ -432,11 +491,14 @@ impl Tree {
                 }
             }
 
-            // Fuzzy date range for the consolidated entry
+            // Fuzzy date range using bit-shift appropriate for faded memories
             let date_prefix = match (earliest, latest) {
                 (Some(e), Some(l)) => {
-                    let e_fuzzy = fuzzy_date(e.timestamp(), retention_threshold);
-                    let l_fuzzy = fuzzy_date(l.timestamp(), retention_threshold);
+                    let shift = temporal_shift_for_age(
+                        (chrono::Utc::now() - e).num_days().max(0) as f32,
+                    );
+                    let e_fuzzy = fuzzy_date_from_shift(e.timestamp() >> shift, shift);
+                    let l_fuzzy = fuzzy_date_from_shift(l.timestamp() >> shift, shift);
                     if e_fuzzy == l_fuzzy {
                         e_fuzzy
                     } else {
@@ -482,7 +544,7 @@ impl Tree {
             let epoch = earliest.map(|e| e.timestamp()).unwrap_or_else(|| now.timestamp());
             self.conn
                 .execute(
-                    "INSERT INTO entries (node_id, content, embedding, source, epoch) VALUES (?1, ?2, ?3, 'consolidated', ?4)",
+                    "INSERT INTO entries (node_id, content, embedding, source, epoch, temporal_epoch) VALUES (?1, ?2, ?3, 'consolidated', ?4, ?4)",
                     params![node_id, condensed, centroid_to_blob(&avg), epoch],
                 )
                 .map_err(|e| format!("insert consolidated: {e}"))?;
@@ -985,23 +1047,43 @@ impl Tree {
 
 // --- Helpers ---
 
-/// Decay a timestamp: lose precision based on Weibull retention.
-/// Recent memories have exact times, old ones become "2025-03" or "long ago".
-pub fn fuzzy_date(epoch: i64, retention: f32) -> String {
-    use chrono::{DateTime, Utc};
-    let dt = DateTime::<Utc>::from_timestamp(epoch, 0)
-        .unwrap_or_else(|| Utc::now());
+/// Compute the bit-shift amount for temporal decay based purely on age.
+/// Access count does NOT protect temporal precision — only content retention.
+pub fn temporal_shift_for_age(days_since_created: f32) -> u32 {
+    // Gradual precision loss based on age alone
+    // Each shift doubles the time window that looks "the same"
+    if days_since_created < 1.0 { 0 }       // today: full second precision
+    else if days_since_created < 7.0 { 4 }   // this week: ~16 second blocks
+    else if days_since_created < 30.0 { 8 }   // this month: ~4 minute blocks
+    else if days_since_created < 90.0 { 12 }  // this quarter: ~1 hour blocks
+    else if days_since_created < 365.0 { 16 } // this year: ~18 hour blocks
+    else if days_since_created < 1095.0 { 20 } // ~3 years: ~12 day blocks
+    else if days_since_created < 3650.0 { 24 } // ~10 years: ~6 month blocks
+    else { 28 }                                // ancient: ~8 year blocks
+}
 
-    if retention > 0.5 {
-        dt.format("%Y-%m-%d %H:%M").to_string()
-    } else if retention > 0.3 {
-        dt.format("%Y-%m-%d").to_string()
-    } else if retention > 0.15 {
-        dt.format("%Y-%m").to_string()
-    } else if retention > 0.05 {
-        dt.format("%Y").to_string()
-    } else {
-        "long ago".to_string()
+/// Reconstruct a fuzzy date string from a shifted epoch and its shift amount.
+pub fn fuzzy_date_from_shift(temporal_epoch: i64, shift: u32) -> String {
+    if temporal_epoch == 0 {
+        return "long ago".to_string();
+    }
+
+    // Shift back left to get approximate epoch
+    let approx_epoch = temporal_epoch << shift;
+
+    use chrono::{DateTime, Utc};
+    let dt = match DateTime::<Utc>::from_timestamp(approx_epoch, 0) {
+        Some(dt) => dt,
+        None => return "long ago".to_string(),
+    };
+
+    match shift {
+        0..=4 => dt.format("%Y-%m-%d %H:%M").to_string(),
+        5..=8 => dt.format("%Y-%m-%d %H:xx").to_string(),
+        9..=12 => dt.format("%Y-%m-%d").to_string(),
+        13..=16 => dt.format("%Y-%m").to_string(),
+        17..=20 => dt.format("%Y").to_string(),
+        _ => "long ago".to_string(),
     }
 }
 

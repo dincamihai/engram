@@ -1,4 +1,4 @@
-//! MCP server — JSON-RPC over stdin/stdout. Four tools: store, search, topics, forget.
+//! MCP server — JSON-RPC over stdin/stdout. Two tools: store, search.
 
 use std::io::{self, BufRead, Write};
 
@@ -45,7 +45,7 @@ impl Response {
 
 pub fn run(tree: Tree, embedder: Embedder) -> Result<(), String> {
     // Initialize aha detector for automatic spreading activation
-    let aha = AhaDetector::new(&embedder, 0.55);
+    let aha = AhaDetector::new(&embedder, 0.40);
     if aha.is_some() {
         eprintln!("[engram] aha detector ready ({} archetypes)", 8);
     }
@@ -117,9 +117,11 @@ fn dispatch(name: &str, args: &serde_json::Value, tree: &Tree, embedder: &Embedd
                 let dated = format!("{}: {}", chrono::Utc::now().format("%Y-%m-%d"), content);
                 match embedder.embed(&dated) {
                     Ok(embedding) => {
-                        // Check for aha moment → auto-replay
+                        // Check for aha moment against raw content (undated)
                         let aha_triggered = if let Some(detector) = aha {
-                            if let Some(sim) = detector.check(&embedding) {
+                            let raw_emb = embedder.embed(content).ok();
+                            let check_emb = raw_emb.as_deref().unwrap_or(&embedding);
+                            if let Some(sim) = detector.check(check_emb) {
                                 let activated = tree.replay(&embedding, 0.2, 5).unwrap_or(0);
                                 Some((sim, activated))
                             } else {
@@ -176,45 +178,6 @@ fn dispatch(name: &str, args: &serde_json::Value, tree: &Tree, embedder: &Embedd
             }
         }
 
-        "engram_topics" => match tree.topics() {
-            Ok(topics) => {
-                let total = tree.count().unwrap_or(0);
-                json!({"total_entries": total, "topics": topics})
-            }
-            Err(e) => json!({"error": e}),
-        },
-
-        "engram_forget" => {
-            let id = args.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
-            if id == 0 {
-                json!({"error": "id is required"})
-            } else {
-                match tree.forget(id) {
-                    Ok(true) => json!({"forgotten": true}),
-                    Ok(false) => json!({"forgotten": false, "reason": "not found"}),
-                    Err(e) => json!({"error": e}),
-                }
-            }
-        }
-
-        "engram_replay" => {
-            let context = args.get("context").and_then(|v| v.as_str()).unwrap_or("");
-            let noise = args.get("noise").and_then(|v| v.as_f64()).unwrap_or(0.2) as f32;
-            let count = args.get("count").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
-
-            if context.is_empty() {
-                json!({"error": "context is required"})
-            } else {
-                match embedder.embed(context) {
-                    Ok(embedding) => match tree.replay(&embedding, noise, count) {
-                        Ok(activated) => json!({"activated": activated, "noise": noise}),
-                        Err(e) => json!({"error": e}),
-                    },
-                    Err(e) => json!({"error": format!("embedding failed: {e}")}),
-                }
-            }
-        }
-
         _ => json!({"error": format!("unknown tool: {name}")}),
     };
 
@@ -245,35 +208,6 @@ fn tools() -> Vec<serde_json::Value> {
                     "limit": {"type": "integer", "description": "Max results (default 5)"}
                 },
                 "required": ["query"]
-            }
-        }),
-        json!({
-            "name": "engram_topics",
-            "description": "List self-organized memory topics with counts.",
-            "inputSchema": {"type": "object", "properties": {}}
-        }),
-        json!({
-            "name": "engram_forget",
-            "description": "Delete a memory by ID.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "integer", "description": "Entry ID to forget"}
-                },
-                "required": ["id"]
-            }
-        }),
-        json!({
-            "name": "engram_replay",
-            "description": "Spreading activation: rehearse memories related to context. Keeps relevant memories alive organically.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "context": {"type": "string", "description": "Current context or topic to activate around"},
-                    "noise": {"type": "number", "description": "Probability of random activation (0-1, default 0.2)"},
-                    "count": {"type": "integer", "description": "Number of memories to activate (default 5)"}
-                },
-                "required": ["context"]
             }
         }),
     ]

@@ -391,3 +391,119 @@ fn source_is_optional() {
     let results = tree.search(&emb, 1).unwrap();
     assert!(results[0].source.is_none());
 }
+
+// --- Temporal bit-shift decay ---
+
+#[test]
+fn fresh_memory_has_full_temporal_precision() {
+    let tree = test_tree(8);
+    let emb = make_embedding(8, 0);
+    tree.store("just now", &emb, None).unwrap();
+
+    let results = tree.search(&emb, 1).unwrap();
+    // Fresh memory: when should contain full date + time
+    assert!(results[0].when.contains(':'), "expected time precision, got: {}", results[0].when);
+}
+
+#[test]
+fn temporal_degrades_with_age() {
+    use engram::birch::{temporal_shift_for_age, fuzzy_date_from_shift};
+
+    let epoch: i64 = 1780000000; // some fixed epoch
+
+    // Fresh: no shift
+    let shift = temporal_shift_for_age(0.5);
+    assert_eq!(shift, 0);
+    let date = fuzzy_date_from_shift(epoch >> shift, shift);
+    assert!(date.contains(':'), "fresh should have time: {date}");
+
+    // 1 week old: shift 4
+    let shift = temporal_shift_for_age(5.0);
+    assert_eq!(shift, 4);
+
+    // 2 months old: shift 12
+    let shift = temporal_shift_for_age(60.0);
+    assert_eq!(shift, 12);
+    let date = fuzzy_date_from_shift(epoch >> shift, shift);
+    assert!(!date.contains(':'), "2 months should not have time: {date}");
+
+    // 2 years old: shift 20
+    let shift = temporal_shift_for_age(730.0);
+    assert_eq!(shift, 20);
+    let date = fuzzy_date_from_shift(epoch >> shift, shift);
+    // Should be just a year
+    assert!(date.len() == 4, "2 years old should be just year: {date}");
+}
+
+#[test]
+fn rebalance_degrades_old_timestamps() {
+    let tree = test_tree(8);
+    let emb = make_embedding(8, 0);
+    tree.store("old memory", &emb, None).unwrap();
+
+    // Backdate to 60 days ago
+    let old_date = (chrono::Utc::now() - chrono::Duration::days(60)).to_rfc3339();
+    tree.conn_exec(
+        &format!("UPDATE entries SET created_at = '{old_date}'"),
+    ).unwrap();
+
+    let result = tree.rebalance().unwrap();
+    assert!(result.contains("degraded"), "expected temporal degradation: {result}");
+
+    // Check that temporal_shift increased
+    let results = tree.search(&emb, 1).unwrap();
+    // 60 days old → shift 12 → day precision, no time
+    assert!(!results[0].when.contains(':'), "should lose time precision: {}", results[0].when);
+}
+
+#[test]
+fn frequently_accessed_old_memory_still_loses_temporal_precision() {
+    let tree = test_tree(8);
+    let emb = make_embedding(8, 0);
+    tree.store("daily password", &emb, None).unwrap();
+
+    // Backdate to 2 years ago but set high access count
+    let old_date = (chrono::Utc::now() - chrono::Duration::days(730)).to_rfc3339();
+    tree.conn_exec(
+        &format!("UPDATE entries SET created_at = '{old_date}', access_count = 1000, last_accessed = '{}'",
+            chrono::Utc::now().to_rfc3339()),
+    ).unwrap();
+
+    tree.rebalance().unwrap();
+
+    let results = tree.search(&emb, 1).unwrap();
+
+    // Content should still rank high (access boost)
+    assert!(results[0].similarity > 0.5, "accessed memory should rank high");
+
+    // But temporal precision should be degraded (age-based, not access-based)
+    assert!(
+        results[0].when.len() <= 4,
+        "2-year old memory should have year-only precision even if accessed daily: {}",
+        results[0].when
+    );
+}
+
+#[test]
+fn same_period_entries_get_identical_temporal_epoch_after_shift() {
+    use engram::birch::temporal_shift_for_age;
+
+    // Two entries 30 seconds apart
+    let epoch_a: i64 = 1780000000;
+    let epoch_b: i64 = 1780000030;
+
+    // At shift 8 (~4 min blocks), they should be identical
+    let shift = temporal_shift_for_age(15.0); // 15 days → shift 8
+    assert_eq!(epoch_a >> shift, epoch_b >> shift, "same 4-min block should match after shift");
+
+    // Two entries 2 hours apart
+    let epoch_c: i64 = 1780007200;
+
+    // At shift 12 (~1 hour blocks), they should be different
+    let shift12 = temporal_shift_for_age(60.0); // 60 days → shift 12
+    assert_ne!(epoch_a >> shift12, epoch_c >> shift12, "2 hours apart should differ at hour blocks");
+
+    // At shift 16 (~18 hour blocks), they should be identical
+    let shift16 = temporal_shift_for_age(200.0); // 200 days → shift 16
+    assert_eq!(epoch_a >> shift16, epoch_c >> shift16, "2 hours apart should merge at day blocks");
+}

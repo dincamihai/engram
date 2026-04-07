@@ -44,6 +44,8 @@ impl AhaDetector {
             .map(|arch| cosine_similarity(message_embedding, arch))
             .fold(f32::NEG_INFINITY, f32::max);
 
+        eprintln!("[engram] aha check: max_sim={:.3} threshold={:.3}", max_sim, self.threshold);
+
         if max_sim >= self.threshold {
             Some(max_sim)
         } else {
