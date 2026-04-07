@@ -102,20 +102,39 @@ fn main() {
             let tree = birch::Tree::open(db_str, embedder.dimension, birch::Config::default())
                 .expect("cannot open tree");
             let embedding = embedder.embed(&query).expect("embedding failed");
-            let results = tree.search(&embedding, limit).expect("search failed");
+            let recall = tree.recall(&embedding, limit).expect("recall failed");
 
-            if results.is_empty() {
+            if recall.is_empty() {
                 println!("no results for: \"{query}\"");
             } else {
-                for (i, e) in results.iter().enumerate() {
-                    println!("[{}] (sim={:.3}) {}", i + 1, e.similarity, e.when);
-                    if let Some(ref src) = e.source {
-                        println!("    source: {src}");
+                let term_width = terminal_width();
+                let prefix_width = 4; // "├── " or "└── "
+                let content_width = term_width.saturating_sub(prefix_width).max(40);
+
+                let blocks: Vec<&str> = recall.split("\n\n").collect();
+                for (i, block) in blocks.iter().enumerate() {
+                    let mut lines = block.lines();
+                    if let Some(header) = lines.next() {
+                        let label = header.trim_end_matches(':');
+                        println!("* ({label})");
+                        let entries: Vec<&str> = lines.collect();
+                        for (j, line) in entries.iter().enumerate() {
+                            let is_last = j == entries.len() - 1;
+                            let branch = if is_last { "└── " } else { "├── " };
+                            let cont   = if is_last { "    " } else { "│   " };
+                            let wrapped = wrap_text(line, content_width);
+                            for (k, wline) in wrapped.iter().enumerate() {
+                                if k == 0 {
+                                    println!("{branch}{wline}");
+                                } else {
+                                    println!("{cont}{wline}");
+                                }
+                            }
+                        }
+                        if i < blocks.len() - 1 {
+                            println!();
+                        }
                     }
-                    for line in e.content.lines().take(3) {
-                        println!("    {line}");
-                    }
-                    println!();
                 }
             }
         }
@@ -378,4 +397,43 @@ fn count_leaves(topics: &[birch::Topic]) -> usize {
             }
         })
         .sum()
+}
+
+fn terminal_width() -> usize {
+    // Try ioctl to get actual terminal width
+    #[cfg(unix)]
+    {
+        use std::mem::zeroed;
+        unsafe {
+            let mut ws: libc::winsize = zeroed();
+            if libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+                return ws.ws_col as usize;
+            }
+        }
+    }
+    // Fall back to COLUMNS env var, then 120
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120)
+}
+
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if text.len() <= width {
+        return vec![text.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut remaining = text;
+    while remaining.len() > width {
+        // Find last space before width
+        let break_at = remaining[..width]
+            .rfind(' ')
+            .unwrap_or(width);
+        lines.push(remaining[..break_at].to_string());
+        remaining = remaining[break_at..].trim_start();
+    }
+    if !remaining.is_empty() {
+        lines.push(remaining.to_string());
+    }
+    lines
 }
