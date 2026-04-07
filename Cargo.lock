@@ -263,6 +263,7 @@ dependencies = [
  "clap",
  "dirs-next",
  "env_logger",
+ "libc",
  "log",
  "reqwest",
  "rusqlite",
