@@ -1,6 +1,6 @@
 # engram
 
-Self-organizing memory for AI agents. Two tools. Everything else is physics.
+Self-organizing memory for AI agents. Two tools. Everything else emerges.
 
 ## Interface
 
