@@ -95,7 +95,8 @@ impl Tree {
                 temporal_epoch INTEGER,
                 temporal_shift INTEGER DEFAULT 0
             );
-            CREATE INDEX IF NOT EXISTS idx_entries_node ON entries(node_id);",
+            CREATE INDEX IF NOT EXISTS idx_entries_node ON entries(node_id);
+            CREATE INDEX IF NOT EXISTS idx_nodes_parent ON nodes(parent_id);",
         )
         .map_err(|e| format!("create tables: {e}"))?;
 
@@ -183,20 +184,95 @@ impl Tree {
         Ok((entry_id, label))
     }
 
-    /// Search for the top-k most similar entries to a query embedding.
-    /// Applies time decay: older, unaccessed memories score lower.
+    /// Search for the top-k most similar entries using tree-guided beam search
+    /// with gap-detection pruning. Descends the BIRCH tree comparing query
+    /// against node centroids, cutting at the largest similarity drop-off.
     pub fn search(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<Entry>, String> {
-        let now = chrono::Utc::now();
+        let root_id = self.root_id()?;
 
+        // Initial beam: root's children scored by centroid similarity
+        let mut beam: Vec<(f32, i64)> = self
+            .children_of(root_id)?
+            .into_iter()
+            .map(|(id, centroid)| (cosine_similarity(query_embedding, &centroid), id))
+            .collect();
+
+        // Empty tree or flat (entries directly on root)
+        if beam.is_empty() {
+            return self.score_entries_in_nodes(query_embedding, &[root_id], limit);
+        }
+
+        // Descend: expand non-leaf nodes, prune by gap detection
+        loop {
+            let mut next_beam: Vec<(f32, i64)> = Vec::new();
+            let mut all_leaves = true;
+
+            for (score, node_id) in &beam {
+                let children = self.children_of(*node_id)?;
+                if children.is_empty() {
+                    next_beam.push((*score, *node_id));
+                } else {
+                    all_leaves = false;
+                    for (child_id, centroid) in children {
+                        let sim = cosine_similarity(query_embedding, &centroid);
+                        next_beam.push((sim, child_id));
+                    }
+                }
+            }
+
+            if all_leaves {
+                break;
+            }
+
+            next_beam.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            let cut = gap_cut(&next_beam, limit);
+            next_beam.truncate(cut);
+            beam = next_beam;
+        }
+
+        let leaf_ids: Vec<i64> = beam.iter().map(|(_, id)| *id).collect();
+        self.score_entries_in_nodes(query_embedding, &leaf_ids, limit)
+    }
+
+    /// Fetch child node IDs and centroids for a given parent.
+    fn children_of(&self, parent_id: i64) -> Result<Vec<(i64, Vec<f32>)>, String> {
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT id, node_id, content, embedding, source, created_at, access_count, last_accessed, epoch, temporal_epoch, temporal_shift FROM entries",
-            )
-            .map_err(|e| format!("prepare search: {e}"))?;
+            .prepare("SELECT id, centroid FROM nodes WHERE parent_id = ?1")
+            .map_err(|e| format!("children_of: {e}"))?;
+        let rows: Vec<(i64, Vec<f32>)> = stmt
+            .query_map(params![parent_id], |row| {
+                let id: i64 = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                Ok((id, blob_to_centroid(&blob)))
+            })
+            .map_err(|e| format!("query children: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
 
+    /// Score entries in the given nodes with decay, access boost, and fuzzy timestamps.
+    fn score_entries_in_nodes(
+        &self,
+        query_embedding: &[f32],
+        node_ids: &[i64],
+        limit: usize,
+    ) -> Result<Vec<Entry>, String> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let now = chrono::Utc::now();
+        let placeholders: String = node_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, node_id, content, embedding, source, created_at, access_count, last_accessed, epoch, temporal_epoch, temporal_shift FROM entries WHERE node_id IN ({})",
+            placeholders
+        );
+
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| format!("prepare score: {e}"))?;
         let mut scored: Vec<(f32, Entry)> = stmt
-            .query_map([], |row| {
+            .query_map(rusqlite::params_from_iter(node_ids), |row| {
                 let id: i64 = row.get(0)?;
                 let _node_id: i64 = row.get(1)?;
                 let content: String = row.get(2)?;
@@ -212,36 +288,31 @@ impl Tree {
                 let embedding = blob_to_centroid(&blob);
                 let raw_sim = cosine_similarity(query_embedding, &embedding);
 
-                // Content decay: based on last access (access count protects content)
                 let ref_date = last_accessed.as_deref().unwrap_or(&created_at);
                 let days_ago = chrono::DateTime::parse_from_rfc3339(ref_date)
                     .map(|dt| (now - dt.to_utc()).num_days().max(0) as f32)
                     .unwrap_or(0.0);
 
-                // Weibull decay: k=0.5 means fast initial decay, survivors stabilize
                 let k: f32 = 0.5;
                 let lambda: f32 = 30.0;
                 let decay = (-(days_ago / lambda).powf(k)).exp();
 
-                // Access boost: each retrieval "rehearses" the memory, resisting content decay
                 let access_boost = (access_count as f32).ln_1p() * 0.03;
                 let score = raw_sim * (0.7 + 0.3 * decay) + access_boost;
 
-                // Fuzzy timestamp: derived from bit-shifted temporal epoch
                 let when = temporal_epoch
                     .map(|te| fuzzy_date_from_shift(te, temporal_shift))
                     .unwrap_or_else(|| created_at.clone());
 
                 Ok((score, Entry { id, content, source, created_at, when, similarity: score }))
             })
-            .map_err(|e| format!("search query: {e}"))?
+            .map_err(|e| format!("score query: {e}"))?
             .filter_map(|r| r.ok())
             .collect();
 
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(limit);
 
-        // Update access stats for returned results
         let ids: Vec<i64> = scored.iter().map(|(_, e)| e.id).collect();
         let now_str = now.to_rfc3339();
         for id in &ids {
@@ -1295,6 +1366,37 @@ pub fn fuzzy_date_from_shift(temporal_epoch: i64, shift: u32) -> String {
         13..=16 => dt.format("%Y-%m").to_string(),
         17..=20 => dt.format("%Y").to_string(),
         _ => "long ago".to_string(),
+    }
+}
+
+/// Find the natural cut point in a sorted (descending) scored list by largest gap.
+/// Returns the number of items to keep. Always keeps at least `min_keep`.
+fn gap_cut(sorted: &[(f32, i64)], min_keep: usize) -> usize {
+    let n = sorted.len();
+    let min_keep = min_keep.max(1).min(n);
+
+    if n <= min_keep {
+        return n;
+    }
+
+    // Find the largest gap between consecutive scores
+    let mut max_gap = 0.0f32;
+    let mut cut_at = n; // default: keep all
+
+    for i in min_keep..n {
+        let gap = sorted[i - 1].0 - sorted[i].0;
+        if gap > max_gap {
+            max_gap = gap;
+            cut_at = i;
+        }
+    }
+
+    // Only cut if the gap is meaningful (> 10% of the score range)
+    let range = sorted[0].0 - sorted[n - 1].0;
+    if range > 0.0 && max_gap / range > 0.1 {
+        cut_at
+    } else {
+        n // no clear gap — keep all
     }
 }
 

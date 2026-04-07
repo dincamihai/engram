@@ -69,28 +69,32 @@ One database: `~/.engram/engram.db` (SQLite).
                               │
                          embed query
                               │
-                  cosine similarity vs all entries
+               tree-guided beam search:
+               compare query vs node centroids,
+               descend into promising branches,
+               gap detection prunes at largest
+               similarity drop-off
                               │
-                  apply Weibull decay + access boost
+               score entries in candidate leaves:
+               cosine similarity + Weibull decay + access boost
                               │
-                  read fuzzy date from bit-shifted epoch
+               read fuzzy date from bit-shifted epoch
                               │
                       return top-k results
                               │
-                  bump access_count on returned entries
+               bump access_count on returned entries
 ```
+
+**Neighborhood recall.** The MCP `search` tool returns cluster neighborhoods instead of flat ranked lists. It finds the best-matching entries, walks up to their parent node, and returns sibling clusters — giving associative context beyond the direct matches. The response is a single text blob with cluster labels, not a structured array of individual entries.
 
 ```
                         rebalance
                               │
-              ┌───────────────┼───────────────┐
-              │               │               │
-      degrade temporal   consolidate      merge small
-      epochs (bit-shift) faded memories   clusters
-              │               │               │
-              └───────────────┼───────────────┘
-                              │
-                      re-label all leaves
+       ┌──────────┬───────────┼───────────┬──────────┐
+       │          │           │           │          │
+   prune ghost  degrade    consolidate  merge     re-label
+   empty nodes  temporal   faded        small     all
+                epochs     memories     clusters  leaves
 ```
 
 ## Running
@@ -112,6 +116,9 @@ engram serve
 ```bash
 engram store "Alice leads the database migration"
 engram search "who works on infrastructure"
+engram forget 42                        # delete entry by ID
+engram forget --source "%SKILL.md"      # bulk delete by source pattern
+engram rebuild                          # re-cluster all entries from scratch
 engram ingest ~/path/to/files
 engram topics
 engram stats
@@ -134,6 +141,10 @@ engram rebalance
 **Why bit-shift for temporal decay?** It's the simplest possible precision degradation. Right-shift an integer and information is irreversibly lost — just like memory. Same-period events become identical after enough shifting, enabling natural temporal merging.
 
 **Why no manual organization tools?** The agent's job is to remember and recall, not to curate. Curation is a human abstraction. The embedding space and clustering tree handle organization better than any tag system could.
+
+**Why gap detection over fixed beam width?** A fixed beam explores the same number of branches regardless of query specificity. Gap detection finds the natural elbow in the similarity curve — specific queries narrow to 1-2 clusters, broad queries explore many. No parameter to tune; the data decides.
+
+**Why neighborhood recall over flat ranked results?** Flat results are a database query. Neighborhood recall returns the cluster context — sibling memories the tree grouped together, even if they weren't in the top-K by similarity. This gives associative context, like how remembering one thing naturally brings related things to mind.
 
 ## Emergent behaviors
 

@@ -507,3 +507,41 @@ fn same_period_entries_get_identical_temporal_epoch_after_shift() {
     let shift16 = temporal_shift_for_age(200.0); // 200 days → shift 16
     assert_eq!(epoch_a >> shift16, epoch_c >> shift16, "2 hours apart should merge at day blocks");
 }
+
+// --- Tree-guided beam search ---
+
+#[test]
+fn gap_detection_finds_correct_cluster() {
+    // Many orthogonal clusters — gap detection should narrow to the right one
+    let config = Config {
+        threshold: 0.8,
+        leaf_capacity: 50,
+        branch_factor: 10,
+    };
+    let tree = Tree::open(":memory:", 8, config).expect("open tree");
+
+    // Create distinct clusters across orthogonal dimensions
+    for i in 0..8 {
+        let emb = make_embedding(8, i);
+        tree.store(&format!("cluster {i} entry"), &emb, None).unwrap();
+    }
+
+    // Search for cluster 3 — gap detection should find the clear winner
+    let query = make_embedding(8, 3);
+    let results = tree.search(&query, 1).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].content, "cluster 3 entry");
+}
+
+#[test]
+fn beam_search_degrades_to_full_scan_for_small_trees() {
+    // With beam_width=10 and only 3 clusters, all are explored
+    let tree = test_tree(8);
+    tree.store("alpha", &make_embedding(8, 0), None).unwrap();
+    tree.store("beta", &make_embedding(8, 3), None).unwrap();
+    tree.store("gamma", &make_embedding(8, 6), None).unwrap();
+
+    // Should find all 3 regardless of query
+    let results = tree.search(&make_embedding(8, 0), 3).unwrap();
+    assert_eq!(results.len(), 3);
+}
