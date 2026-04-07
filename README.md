@@ -97,13 +97,27 @@ One database: `~/.engram/engram.db` (SQLite).
                 epochs     memories     clusters  leaves
 ```
 
-## Running
+## Install
 
 Requires [Ollama](https://ollama.ai) with an embedding model:
 
 ```bash
 ollama pull embeddinggemma
 ```
+
+One-command install for Claude Code (downloads the binary, registers the MCP server, configures hooks):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dincamihai/engram/main/install.sh | bash
+```
+
+Or a specific version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dincamihai/engram/main/install.sh | bash -s v0.1.0
+```
+
+## Running
 
 ### As MCP server (for Claude Code)
 
