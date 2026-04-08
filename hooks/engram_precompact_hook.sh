@@ -1,18 +1,5 @@
 #!/bin/bash
-# Engram pre-compact hook — save context before Claude Code compresses conversation.
+# Engram pre-compact hook — remind Claude to save important context before compaction.
 # Called by Claude Code's PreCompact hook.
 
-ENGRAM="/Users/mid/Repos/engram/target/release/engram"
-export OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://localhost:11434}"
-export OLLAMA_EMBED_MODEL="${OLLAMA_EMBED_MODEL:-embeddinggemma}"
-
-# Read the transcript summary from stdin (Claude Code pipes it)
-SUMMARY=$(cat)
-
-if [ -z "$SUMMARY" ]; then
-    exit 0
-fi
-
-$ENGRAM store "$SUMMARY" --source "claude-code-precompact" 2>/dev/null
-
-exit 0
+echo '{"hookSpecificOutput":{"hookEventName":"PreCompact","additionalContext":"Context is about to be compacted. Before proceeding, review the conversation for any important information worth saving to engram memory (engram_store): decisions made, issues resolved, patterns discovered, deployment outcomes. Save anything that would be useful in future sessions."}}'
