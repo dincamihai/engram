@@ -176,6 +176,68 @@ These behaviors aren't coded as features — they emerge from the interaction be
 
 **The agent is the intelligence.** The engine provides two tools: `store` and `search`. Everything else — synthesis, linking, contradiction detection, importance judgments — is the agent's responsibility. The engine handles physics (clustering, decay, activation). The agent handles meaning. This separation keeps the engine simple and the agent powerful.
 
+## Claude Code Hooks
+
+Engram integrates with Claude Code's hook system to provide autoMemory-like behavior — automatic recall at session start and memory nudges during work.
+
+### SessionStart — Memory Injection
+
+A `SessionStart` hook searches engram using the current month and date as a query bias, returning the most relevant recent memories and injecting them as context at the start of every session.
+
+**Trick:** Entries are prefixed with timestamps (e.g., `2026-04-08:`). Passing a date string as part of the search query biases semantic similarity toward memories from that time period. Use recent dates for current context, older dates for distant recall.
+
+```bash
+#!/bin/bash
+TODAY=$(date +%Y-%m-%d)
+MONTH=$(date +"%B %Y")
+QUERY="$MONTH recent work context $TODAY"
+RESULT=$(engram search "$QUERY" --limit 10 2>/dev/null | head -100)
+if [ -n "$RESULT" ]; then
+  ESCAPED=$(echo "$RESULT" | python3 -c "import sys,json; s=json.dumps(sys.stdin.read()); print(s[1:-1])")
+  echo "{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"== Engram Memory (auto-loaded) ==\n${ESCAPED}\n== End Engram Memory ==\"}}"
+fi
+```
+
+### PreCompact — Save Before Compaction
+
+A `PreCompact` hook fires before Claude Code compacts the conversation context. It injects a reminder to review the conversation and save important information (decisions, outcomes, patterns) to engram before context is lost.
+
+```bash
+#!/bin/bash
+echo '{"hookSpecificOutput":{"hookEventName":"PreCompact","additionalContext":"Context is about to be compacted. Save any important information to engram memory before proceeding."}}'
+```
+
+### PostToolUse — Work Completion Nudges
+
+PostToolUse hooks nudge Claude to consider saving memories after significant work. For example, matching Bash commands containing `git push`, `git commit`, or CI/CD tool invocations:
+
+```json
+{
+  "matcher": "Bash",
+  "hooks": [{
+    "type": "command",
+    "command": "jq -r '.tool_input.command' | grep -qE 'git (push|commit)' && echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"Significant work detected. Consider saving memories via engram_store.\"}}' || true"
+  }]
+}
+```
+
+Similarly, an Edit matcher can fire after editing files in specific directories (e.g., a notes vault).
+
+### Hook Configuration
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "engram-session-start.sh", "timeout": 15 }] }],
+    "PreCompact": [{ "hooks": [{ "type": "command", "command": "engram-pre-compact.sh" }] }],
+    "PostToolUse": [
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "..." }] },
+      { "matcher": "Edit", "hooks": [{ "type": "command", "command": "..." }] }
+    ]
+  }
+}
+```
+
 ## Credits
 
 Built with [Ollama](https://ollama.ai) for embeddings and [rusqlite](https://github.com/rusqlite/rusqlite) for persistence.
