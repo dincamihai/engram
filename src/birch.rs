@@ -833,12 +833,14 @@ impl Tree {
                 *v /= n;
             }
 
-            // Insert consolidated entry
+            // Insert consolidated entry with display version
+            let (consolidated_display, consolidated_level) = crate::compress::auto_compress(condensed);
+            let consolidated_level_i32 = consolidated_level.as_i32();
             let epoch = earliest.map(|e| e.timestamp()).unwrap_or_else(|| now.timestamp());
             self.conn
                 .execute(
-                    "INSERT INTO entries (node_id, content, embedding, source, epoch, temporal_epoch) VALUES (?1, ?2, ?3, 'consolidated', ?4, ?4)",
-                    params![node_id, condensed, centroid_to_blob(&avg), epoch],
+                    "INSERT INTO entries (node_id, content, content_display, compression_level, embedding, source, epoch, temporal_epoch) VALUES (?1, ?2, ?3, ?4, ?5, 'consolidated', ?6, ?6)",
+                    params![node_id, condensed, consolidated_display, consolidated_level_i32, centroid_to_blob(&avg), epoch],
                 )
                 .map_err(|e| format!("insert consolidated: {e}"))?;
 
