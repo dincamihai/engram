@@ -32,6 +32,8 @@ impl Default for Config {
 pub struct Entry {
     pub id: i64,
     pub content: String,
+    pub content_display: Option<String>,
+    pub compression_level: i32,
     pub source: Option<String>,
     pub created_at: String,
     pub when: String,
@@ -104,6 +106,8 @@ impl Tree {
         for col in &[
             "ALTER TABLE entries ADD COLUMN temporal_epoch INTEGER",
             "ALTER TABLE entries ADD COLUMN temporal_shift INTEGER DEFAULT 0",
+            "ALTER TABLE entries ADD COLUMN content_display TEXT",
+            "ALTER TABLE entries ADD COLUMN compression_level INTEGER DEFAULT 0",
         ] {
             conn.execute_batch(col).ok(); // ignore "duplicate column" errors
         }
@@ -153,12 +157,16 @@ impl Tree {
             return Ok((-1, label));
         }
 
+        // Compress content for display
+        let (content_display, compression_level) = crate::compress::auto_compress(content);
+        let compression_level_i32 = compression_level.as_i32();
+
         // Insert the entry
         let epoch = chrono::Utc::now().timestamp();
         self.conn
             .execute(
-                "INSERT INTO entries (node_id, content, embedding, source, epoch, temporal_epoch) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-                params![node_id, content, centroid_to_blob(embedding), source, epoch],
+                "INSERT INTO entries (node_id, content, content_display, compression_level, embedding, source, epoch, temporal_epoch) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                params![node_id, content, content_display, compression_level_i32, centroid_to_blob(embedding), source, epoch],
             )
             .map_err(|e| format!("insert entry: {e}"))?;
 
@@ -266,7 +274,7 @@ impl Tree {
         let now = chrono::Utc::now();
         let placeholders: String = node_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
-            "SELECT id, node_id, content, embedding, source, created_at, access_count, last_accessed, epoch, temporal_epoch, temporal_shift FROM entries WHERE node_id IN ({})",
+            "SELECT id, node_id, content, content_display, compression_level, embedding, source, created_at, access_count, last_accessed, epoch, temporal_epoch, temporal_shift FROM entries WHERE node_id IN ({})",
             placeholders
         );
 
@@ -276,14 +284,16 @@ impl Tree {
                 let id: i64 = row.get(0)?;
                 let _node_id: i64 = row.get(1)?;
                 let content: String = row.get(2)?;
-                let blob: Vec<u8> = row.get(3)?;
-                let source: Option<String> = row.get(4)?;
-                let created_at: String = row.get(5)?;
-                let access_count: i64 = row.get(6)?;
-                let last_accessed: Option<String> = row.get(7)?;
-                let _epoch: Option<i64> = row.get(8)?;
-                let temporal_epoch: Option<i64> = row.get(9)?;
-                let temporal_shift: u32 = row.get::<_, u32>(10)?;
+                let content_display: Option<String> = row.get(3)?;
+                let compression_level: i32 = row.get(4)?;
+                let blob: Vec<u8> = row.get(5)?;
+                let source: Option<String> = row.get(6)?;
+                let created_at: String = row.get(7)?;
+                let access_count: i64 = row.get(8)?;
+                let last_accessed: Option<String> = row.get(9)?;
+                let _epoch: Option<i64> = row.get(10)?;
+                let temporal_epoch: Option<i64> = row.get(11)?;
+                let temporal_shift: u32 = row.get::<_, u32>(12)?;
 
                 let embedding = blob_to_centroid(&blob);
                 let raw_sim = cosine_similarity(query_embedding, &embedding);
@@ -304,7 +314,7 @@ impl Tree {
                     .map(|te| fuzzy_date_from_shift(te, temporal_shift))
                     .unwrap_or_else(|| created_at.clone());
 
-                Ok((score, Entry { id, content, source, created_at, when, similarity: score }))
+                Ok((score, Entry { id, content, content_display, compression_level, source, created_at, when, similarity: score }))
             })
             .map_err(|e| format!("score query: {e}"))?
             .filter_map(|r| r.ok())
@@ -408,10 +418,14 @@ impl Tree {
 
             let mut stmt = self
                 .conn
-                .prepare("SELECT content FROM entries WHERE node_id = ?1")
+                .prepare("SELECT content, content_display FROM entries WHERE node_id = ?1")
                 .map_err(|e| format!("entries: {e}"))?;
             let cluster_entries: Vec<String> = stmt
-                .query_map(params![node_id], |row| row.get(0))
+                .query_map(params![node_id], |row| {
+                    let content: String = row.get(0)?;
+                    let display: Option<String> = row.get(1)?;
+                    Ok(display.unwrap_or(content))
+                })
                 .map_err(|e| format!("query entries: {e}"))?
                 .filter_map(|r| r.ok())
                 .collect();
@@ -790,23 +804,20 @@ impl Tree {
                 _ => "long ago".to_string(),
             };
 
-            // Concatenate contents, average embeddings
-            let combined_content: String = entries
+            // Compress contents with semantic extraction, average embeddings
+            let raw_content: String = entries
                 .iter()
                 .map(|(_, c, _, _)| c.as_str())
                 .collect::<Vec<_>>()
                 .join(" | ");
-            let combined_content = format!("{}: {}", date_prefix, combined_content);
+            let combined_content = format!("{}: {}", date_prefix, raw_content);
 
-            // Truncate to keep it reasonable
-            let condensed = if combined_content.len() > 2000 {
-                let end = combined_content.char_indices()
-                    .nth(2000)
-                    .map(|(i, _)| i)
-                    .unwrap_or(combined_content.len());
-                &combined_content[..end]
+            // Use semantic (YAKE) compression for consolidated memories
+            let compressed = crate::compress::compress(&combined_content, crate::compress::Strategy::Semantic);
+            let condensed = if compressed.len() > 2000 {
+                &compressed[..compressed.char_indices().nth(2000).map(|(i, _)| i).unwrap_or(compressed.len())]
             } else {
-                &combined_content
+                &compressed
             };
 
             // Average embedding

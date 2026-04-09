@@ -16,3 +16,5 @@ env_logger = "0.11"
 walkdir = "2"
 dirs-next = "2"
 libc = "0.2"
+stop-words = "0.10"
+yake-rust = { version = "1", features = ["en", "ro", "fr", "de", "es", "it", "pt", "nl"] }
