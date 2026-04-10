@@ -224,9 +224,7 @@ fn main() {
         }
 
         Commands::Viz => {
-            let tree = birch::Tree::open(db_str, 768, birch::Config::default())
-                .expect("cannot open tree");
-            if let Err(e) = engram::viz::run_viz(&tree) {
+            if let Err(e) = engram::viz::run_viz(db_str) {
                 eprintln!("viz error: {e}");
             }
         }

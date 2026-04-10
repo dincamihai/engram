@@ -1542,15 +1542,17 @@ impl Tree {
                 let id: i64 = row.get(0)?;
                 let parent_id: Option<i64> = row.get(1)?;
                 let centroid_blob: Vec<u8> = row.get(2)?;
-                let count: i64 = row.get(3)?;
+                let _stored_count: i64 = row.get(3)?;
                 let label: String = row.get(4)?;
                 let depth: i32 = row.get(5)?;
-                Ok((id, parent_id, centroid_blob, count, label, depth))
+                Ok((id, parent_id, centroid_blob, _stored_count, label, depth))
             })
             .map_err(|e| format!("query all_nodes: {e}"))?
             .filter_map(|r| r.ok())
-            .map(|(id, parent_id, centroid_blob, count, label, depth)| {
+            .map(|(id, parent_id, centroid_blob, _stored_count, label, depth)| {
                 let centroid = blob_to_centroid(&centroid_blob);
+                // Use live count from entries table, not stale count from nodes
+                let count = self.node_entry_count(id).unwrap_or(_stored_count);
                 GraphNode { id, parent_id, centroid, count, label, depth }
             })
             .collect();

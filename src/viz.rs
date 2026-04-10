@@ -3,17 +3,19 @@
 //! Uses dotmax for braille canvas rendering, ascii-petgraph for force-directed
 //! layout, and ratatui for terminal management.
 
+use std::collections::HashMap;
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use ascii_petgraph::physics::{PhysicsConfig, PhysicsEngine};
+use ascii_petgraph::physics::{PhysicsConfig, PhysicsEngine, Vec2};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use dotmax::primitives::draw_line;
 use dotmax::BrailleGrid;
-use petgraph::graph::DiGraph;
+use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
+use petgraph::Direction;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -32,6 +34,22 @@ struct VizNode {
     access: i64,
 }
 
+/// Animation state for a node.
+#[derive(Debug, Clone)]
+enum NodeAnim {
+    /// Node was added — blink yellow/blue for `frames_left` frames.
+    Growing { progress: f32 },
+    /// Node lost entries — blink yellow/red for `frames_left` frames.
+    Shrinking { progress: f32 },
+    /// Branch vibration — node shakes slightly (triggered on child changes).
+    Vibrating { progress: f32 },
+    /// Normal, stable.
+    Stable,
+}
+
+const ANIM_SPEED: f32 = 0.02; // progress per frame (~1.7s at 30fps for full cycle)
+const VIBRATE_AMPLITUDE: f64 = 3.0; // pixels of shake
+
 /// State for the visualization.
 struct VizState {
     graph: DiGraph<VizNode, ()>,
@@ -44,9 +62,15 @@ struct VizState {
     paused: bool,
     grid_w: usize,
     grid_h: usize,
+    /// Per-node animation state (keyed by petgraph NodeIndex).
+    animations: HashMap<NodeIndex, NodeAnim>,
+    /// Last known set of BIRCH node IDs (for polling diff).
+    known_ids: std::collections::HashSet<i64>,
+    /// When we last polled the DB for changes.
+    last_poll: Instant,
 }
 
-pub fn run_viz(tree: &birch::Tree) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_viz(db_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Setup terminal
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -55,12 +79,14 @@ pub fn run_viz(tree: &birch::Tree) -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    // Build graph from BIRCH tree
+    // Open tree and build initial state
+    let tree = birch::Tree::open(db_path, 768, birch::Config::default())
+        .map_err(|e| format!("open tree: {e}"))?;
     let size = terminal.size()?;
-    let state = build_state(tree, size.width as usize, size.height as usize)?;
+    let state = build_state(&tree, size.width as usize, size.height as usize)?;
 
-    // Run the event loop
-    let result = run_loop(&mut terminal, state);
+    // Run the event loop with polling
+    let result = run_loop(&mut terminal, state, db_path);
 
     // Restore terminal
     terminal::disable_raw_mode()?;
@@ -127,6 +153,12 @@ fn build_state(tree: &birch::Tree, width: usize, height: usize) -> Result<VizSta
 
     let grid = BrailleGrid::new(width, height)?;
 
+    // All initial nodes are stable
+    let animations: HashMap<NodeIndex, NodeAnim> = graph.node_indices()
+        .map(|idx| (idx, NodeAnim::Stable))
+        .collect();
+    let known_ids: std::collections::HashSet<i64> = nodes.iter().map(|n| n.id).collect();
+
     Ok(VizState {
         graph,
         physics,
@@ -138,18 +170,244 @@ fn build_state(tree: &birch::Tree, width: usize, height: usize) -> Result<VizSta
         paused: false,
         grid_w: width,
         grid_h: height,
+        animations,
+        known_ids,
+        last_poll: Instant::now(),
     })
+}
+
+/// Poll the DB for changes and update the graph.
+/// Detects: new nodes (coagulate), removed nodes (disperse), changed nodes (pulse).
+fn poll_changes(state: &mut VizState, db_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let tree = birch::Tree::open(db_path, 768, birch::Config::default())
+        .map_err(|e| format!("reopen tree: {e}"))?;
+    let nodes = tree.all_nodes().map_err(|e| format!("all_nodes: {e}"))?;
+    let current_ids: std::collections::HashSet<i64> = nodes.iter().map(|n| n.id).collect();
+
+    // Find new nodes (in DB but not in graph)
+    let new_ids: Vec<i64> = current_ids.difference(&state.known_ids).copied().collect();
+    // Find removed nodes (in graph but not in DB)
+    let removed_ids: Vec<i64> = state.known_ids.difference(&current_ids).copied().collect();
+    // Find changed nodes (count changed)
+    let mut changed = false;
+
+    if new_ids.is_empty() && removed_ids.is_empty() {
+        // Check for count changes on existing nodes — triggers a pulse animation
+        for node_idx in state.graph.node_indices() {
+            let viz_id = state.graph[node_idx].id;
+            if let Some(db_node) = nodes.iter().find(|n| n.id == viz_id) {
+                let old_count = state.graph[node_idx].count;
+                let new_count = db_node.count;
+                if old_count != new_count {
+                    state.graph[node_idx].count = new_count;
+                    let idx_usize = node_idx.index();
+                    if idx_usize < state.animations.len() {
+                        // Growing = blink+pulse, shrinking = blink+shrink
+                        if new_count > old_count {
+                            state.animations.insert(node_idx, NodeAnim::Growing { progress: 0.0 });
+                            vibrate_branch(&state.graph, node_idx, &mut state.animations);
+                        } else {
+                            state.animations.insert(node_idx, NodeAnim::Shrinking { progress: 0.0 });
+                            vibrate_branch(&state.graph, node_idx, &mut state.animations);
+                        }
+                    }
+                    changed = true;
+                }
+                // Also update label if it changed (e.g. after rebalance)
+                if state.graph[node_idx].label != db_node.label {
+                    state.graph[node_idx].label = db_node.label.clone();
+                    changed = true;
+                }
+            }
+        }
+        state.known_ids = current_ids;
+        if changed {
+            // Small nudge: give a few physics ticks to absorb the change
+            for _ in 0..3 {
+                state.physics.tick(&state.graph);
+            }
+        }
+        return Ok(());
+    }
+
+    // Add new nodes with Coagulating animation
+    for &id in &new_ids {
+        if let Some(node) = nodes.iter().find(|n| n.id == id) {
+            let access = tree.node_total_access(node.id).unwrap_or(0);
+            let viz_node = VizNode {
+                id: node.id,
+                label: node.label.clone(),
+                count: node.count,
+                depth: node.depth,
+                access,
+            };
+            let idx = state.graph.add_node(viz_node);
+            // Add edge to parent if parent exists in graph
+            if let Some(parent_id) = node.parent_id {
+                if let Some(parent_idx) = state.graph.node_indices().find(|&ni| state.graph[ni].id == parent_id) {
+                    state.graph.add_edge(parent_idx, idx, ());
+                }
+            }
+            state.animations.insert(idx, NodeAnim::Growing { progress: 0.0 });
+        }
+    }
+
+    // Mark removed nodes as Shrinking
+    for &id in &removed_ids {
+        if let Some(idx) = state.graph.node_indices().find(|&ni| state.graph[ni].id == id) {
+            state.animations.insert(idx, NodeAnim::Shrinking { progress: 0.0 });
+        }
+    }
+
+    state.known_ids = current_ids;
+
+    // Instead of rebuilding physics, add new node positions near their parents
+    // and let the existing simulation absorb them
+    for &id in &new_ids {
+        if let Some(idx) = state.graph.node_indices().find(|&ni| state.graph[ni].id == id) {
+            // Find parent position and place new node nearby
+            let parent_pos = state.graph.neighbors_directed(idx, petgraph::Direction::Incoming)
+                .next()
+                .and_then(|pidx| {
+                    let p_i = pidx.index();
+                    if p_i < state.physics.nodes.len() {
+                        Some(state.physics.nodes[p_i].position)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| {
+                    // No parent or parent not found: random position near center
+                    let angle = (id as f64).to_radians();
+                    Vec2::new(angle.cos() * 50.0, angle.sin() * 50.0)
+                });
+
+            // Place near parent with small random offset
+            let offset = Vec2::new(
+                ((id * 17) % 20) as f64 - 10.0,
+                ((id * 31) % 20) as f64 - 10.0,
+            );
+            let new_pos = parent_pos + offset;
+
+            // Insert position into physics engine
+            // We need to extend the nodes vec - pad with positions matching graph order
+            let idx_i = idx.index();
+            while state.physics.nodes.len() <= idx_i {
+                state.physics.nodes.push(ascii_petgraph::physics::NodePhysics::new(0.0, 0.0));
+            }
+            state.physics.nodes[idx_i].position = new_pos;
+            state.physics.nodes[idx_i].velocity = Vec2::new(0.0, 0.0);
+        }
+    }
+
+    Ok(())
+}
+
+/// Remove fully shrunk nodes from the graph.
+fn remove_dispersed(state: &mut VizState) {
+    let to_remove: Vec<NodeIndex> = state
+        .animations
+        .iter()
+        .filter_map(|(&idx, anim)| {
+            if let NodeAnim::Shrinking { progress } = anim {
+                if *progress >= 1.0 { Some(idx) } else { None }
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if to_remove.is_empty() {
+        return;
+    }
+
+    for idx in &to_remove {
+        state.graph.remove_node(*idx);
+        state.animations.remove(idx);
+    }
+
+    // Rebuild physics
+    let config = state.physics.config.clone();
+    state.physics = PhysicsEngine::new(&state.graph, config);
+    for _ in 0..5 {
+        state.physics.tick(&state.graph);
+    }
+    state.physics.normalize_positions();
+}
+
+/// Vibrate the branch (parent and siblings) of a changed node.
+/// Only applies Vibrating to nodes that are currently Stable (doesn't override Growing/Shrinking).
+fn vibrate_branch(graph: &DiGraph<VizNode, ()>, node_idx: NodeIndex, animations: &mut HashMap<NodeIndex, NodeAnim>) {
+    // Vibrate parent
+    if let Some(parent) = graph.neighbors_directed(node_idx, petgraph::Direction::Incoming).next() {
+        if matches!(animations.get(&parent), Some(NodeAnim::Stable) | None) {
+            animations.insert(parent, NodeAnim::Vibrating { progress: 0.0 });
+        }
+    }
+    // Vibrate siblings (but not the node itself — it already has Growing/Shrinking)
+    if let Some(parent) = graph.neighbors_directed(node_idx, petgraph::Direction::Incoming).next() {
+        for sibling in graph.neighbors_directed(parent, petgraph::Direction::Outgoing) {
+            if sibling != node_idx {
+                if matches!(animations.get(&sibling), Some(NodeAnim::Stable) | None) {
+                    animations.insert(sibling, NodeAnim::Vibrating { progress: 0.0 });
+                }
+            }
+        }
+    }
+}
+
+/// Advance animation progress by one frame.
+fn tick_animations(state: &mut VizState) {
+    for anim in state.animations.values_mut() {
+        match anim {
+            NodeAnim::Growing { progress } => {
+                *progress += ANIM_SPEED;
+                if *progress >= 1.0 {
+                    *anim = NodeAnim::Stable;
+                }
+            }
+            NodeAnim::Shrinking { progress } => {
+                *progress += ANIM_SPEED;
+                if *progress >= 1.0 {
+                    *anim = NodeAnim::Stable;
+                }
+            }
+            NodeAnim::Vibrating { progress } => {
+                *progress += ANIM_SPEED * 1.5;
+                if *progress >= 1.0 {
+                    *anim = NodeAnim::Stable;
+                }
+            }
+            NodeAnim::Stable => {}
+        }
+    }
 }
 
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     mut state: VizState,
+    db_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
+        // Advance animations
+        tick_animations(&mut state);
+
+        // Remove fully dispersed nodes
+        remove_dispersed(&mut state);
+
         // Physics step
         if !state.paused && !state.physics.is_stable() {
             state.physics.tick(&state.graph);
             state.physics.normalize_positions();
+        }
+
+        // Poll DB for changes every 2 seconds
+        if state.last_poll.elapsed() >= Duration::from_secs(2) {
+            if let Err(e) = poll_changes(&mut state, db_path) {
+                // Don't crash on poll errors, just log
+                eprintln!("[engram viz] poll error: {e}");
+            }
+            state.last_poll = Instant::now();
         }
 
         // Render
@@ -262,14 +520,52 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
         }
     }
 
-    // Draw nodes as braille dots
+    // Draw nodes as braille dots with animation
     for node_idx in state.graph.node_indices() {
         let pos = state.physics.position(node_idx);
-        let (px, py) = to_pixel(pos);
+        let (mut px, mut py) = to_pixel(pos);
         let node = &state.graph[node_idx];
+        let i = node_idx.index();
 
         // Bounds check (braille pixels)
         if px < 0 || py < 0 {
+            continue;
+        }
+
+        // Apply animation effects
+        let anim = state.animations.get(&node_idx).unwrap_or(&NodeAnim::Stable);
+        let mut visible = true;
+        let mut size_boost = 0usize;
+
+        match anim {
+            NodeAnim::Growing { progress } => {
+                // Blink: alternate visibility (visible ~70% of time)
+                let phase = (*progress * 12.0_f32).sin();
+                if phase < -0.5 {
+                    visible = false;
+                }
+                // Size pulse: starts big then settles
+                size_boost = ((1.0 - *progress) * 3.0) as usize;
+            }
+            NodeAnim::Shrinking { progress } => {
+                // Blink: alternate visibility (slower)
+                let phase = (*progress * 10.0_f32).sin();
+                if phase < -0.3 {
+                    visible = false;
+                }
+                // Shrink over time
+                size_boost = 0;
+            }
+            NodeAnim::Vibrating { progress } => {
+                // Small position jitter
+                let phase = *progress as f64 * 20.0;
+                px += (phase.sin() * VIBRATE_AMPLITUDE) as i32;
+                py += (phase.cos() * VIBRATE_AMPLITUDE) as i32;
+            }
+            NodeAnim::Stable => {}
+        }
+
+        if !visible || px < 0 || py < 0 {
             continue;
         }
         let ux = px as usize;
@@ -278,32 +574,25 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
             continue;
         }
 
-        if node.depth == 0 {
-            // Root node: 3x2 cluster
-            for dx in 0..3 {
-                for dy in 0..2 {
-                    let nx = ux + dx;
-                    let ny = uy + dy;
-                    if nx < state.grid_w * 2 && ny < state.grid_h * 4 {
-                        state.grid.set_dot(nx, ny).ok();
-                    }
+        let dot_size = if node.depth == 0 { 3 + size_boost } else { 1 + size_boost };
+
+        for dx in 0..dot_size {
+            for dy in 0..dot_size.min(2 + size_boost) {
+                let nx = ux + dx;
+                let ny = uy + dy;
+                if nx < state.grid_w * 2 && ny < state.grid_h * 4 {
+                    state.grid.set_dot(nx, ny).ok();
                 }
             }
-        } else {
-            // Single dot
-            state.grid.set_dot(ux, uy).ok();
+        }
 
-            // Bigger cluster for nodes with many entries
-            if node.count > 5 {
-                if ux + 1 < state.grid_w * 2 {
-                    state.grid.set_dot(ux + 1, uy).ok();
-                }
-                if uy + 1 < state.grid_h * 4 {
-                    state.grid.set_dot(ux, uy + 1).ok();
-                }
-                if ux + 1 < state.grid_w * 2 && uy + 1 < state.grid_h * 4 {
-                    state.grid.set_dot(ux + 1, uy + 1).ok();
-                }
+        // Extra dots for big clusters
+        if node.count > 5 && dot_size <= 1 {
+            if ux + 1 < state.grid_w * 2 {
+                state.grid.set_dot(ux + 1, uy).ok();
+            }
+            if uy + 1 < state.grid_h * 4 {
+                state.grid.set_dot(ux, uy + 1).ok();
             }
         }
     }
@@ -350,12 +639,14 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
     }
 
     // HUD: status line at the bottom
+    let anim_count = state.animations.values().filter(|a| !matches!(a, NodeAnim::Stable)).count();
     let status = format!(
-        " nodes:{} edges:{} zoom:{:.1}x {} [q]uit [r]eset [+/-]zoom [arrows]pan [l]abels [space]pause ",
+        " nodes:{} edges:{} zoom:{:.1}x {} anims:{} [q]uit [r]eset [+/-]zoom [arrows]pan [l]abels [space]pause ",
         state.graph.node_count(),
         state.graph.edge_count(),
         state.zoom,
         if state.paused { "PAUSED" } else if state.physics.is_stable() { "STABLE" } else { "SETTLING" },
+        anim_count,
     );
     let status_widget = ratatui::widgets::Paragraph::new(
         Span::styled(status, Style::default().fg(Color::DarkGray)),
