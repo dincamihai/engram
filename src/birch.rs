@@ -80,6 +80,17 @@ pub struct TopicTree {
     pub children: Vec<TopicTree>,
 }
 
+/// A node in the BIRCH tree for graph visualization.
+#[derive(Debug, Clone)]
+pub struct GraphNode {
+    pub id: i64,
+    pub parent_id: Option<i64>,
+    pub centroid: Vec<f32>,
+    pub count: i64,
+    pub label: String,
+    pub depth: i32,
+}
+
 /// The BIRCH tree.
 pub struct Tree {
     conn: Connection,
@@ -1517,6 +1528,45 @@ impl Tree {
             .collect();
 
         Ok(entries)
+    }
+
+    /// Get all nodes with their centroids for graph visualization.
+    pub fn all_nodes(&self) -> Result<Vec<GraphNode>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, parent_id, centroid, count, label, depth FROM nodes ORDER BY depth, id")
+            .map_err(|e| format!("prepare all_nodes: {e}"))?;
+
+        let nodes: Vec<GraphNode> = stmt
+            .query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                let parent_id: Option<i64> = row.get(1)?;
+                let centroid_blob: Vec<u8> = row.get(2)?;
+                let count: i64 = row.get(3)?;
+                let label: String = row.get(4)?;
+                let depth: i32 = row.get(5)?;
+                Ok((id, parent_id, centroid_blob, count, label, depth))
+            })
+            .map_err(|e| format!("query all_nodes: {e}"))?
+            .filter_map(|r| r.ok())
+            .map(|(id, parent_id, centroid_blob, count, label, depth)| {
+                let centroid = blob_to_centroid(&centroid_blob);
+                GraphNode { id, parent_id, centroid, count, label, depth }
+            })
+            .collect();
+
+        Ok(nodes)
+    }
+
+    /// Get total access count for a node's entries.
+    pub fn node_total_access(&self, node_id: i64) -> Result<i64, String> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(SUM(access_count), 0) FROM entries WHERE node_id = ?1",
+                rusqlite::params![node_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("node_total_access: {e}"))
     }
 }
 

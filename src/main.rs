@@ -65,6 +65,8 @@ enum Commands {
         #[arg(long, default_value = "0")]
         limit: usize,
     },
+    /// X-ray live: animated BIRCH tree visualization
+    Viz,
 }
 
 fn main() {
@@ -218,6 +220,14 @@ fn main() {
                 }
             } else {
                 print_tree(&tree, width);
+            }
+        }
+
+        Commands::Viz => {
+            let tree = birch::Tree::open(db_str, 768, birch::Config::default())
+                .expect("cannot open tree");
+            if let Err(e) = engram::viz::run_viz(&tree) {
+                eprintln!("viz error: {e}");
             }
         }
 

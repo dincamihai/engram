@@ -19,3 +19,8 @@ libc = "0.2"
 stop-words = "0.10"
 yake-rust = { version = "1", features = ["en", "ro", "fr", "de", "es", "it", "pt", "nl"] }
 termtree = "0.5"
+dotmax = "0.1"
+ascii-petgraph = "0.2"
+ratatui = "0.29"
+crossterm = "0.29"
+petgraph = "0.8"

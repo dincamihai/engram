@@ -3,3 +3,4 @@ pub mod birch;
 pub mod compress;
 pub mod embed;
 pub mod mcp;
+pub mod viz;
