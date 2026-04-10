@@ -559,8 +559,9 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
         let node = &state.graph[node_idx];
         if node.count <= 0 { continue; }
         let count = (node.count) as usize;
-        let label = if node.label.len() > label_width - 1 {
-            format!("{}..", &node.label[..label_width - 3])
+        let label = if node.label.chars().count() > label_width - 1 {
+            let truncated: String = node.label.chars().take(label_width - 3).collect();
+            format!("{}..", truncated)
         } else {
             node.label.clone()
         };
@@ -1024,8 +1025,9 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
                 let col = (px as u16) / 2;
                 let row = (py as u16) / 4;
                 if col < area.width.saturating_sub(2) && row < area.height.saturating_sub(1) {
-                    let short_label = if node.label.len() > 15 {
-                        format!("{}..", &node.label[..13])
+                    let short_label = if node.label.chars().count() > 15 {
+                        let truncated: String = node.label.chars().take(13).collect();
+                        format!("{}..", truncated)
                     } else {
                         node.label.clone()
                     };
