@@ -96,6 +96,7 @@ pub struct Tree {
     conn: Connection,
     config: Config,
     dimension: usize,
+    path: String,
 }
 
 impl Tree {
@@ -147,9 +148,14 @@ impl Tree {
             "CREATE INDEX IF NOT EXISTS idx_entries_temporal ON entries(temporal_epoch);",
         ).ok();
 
-        let tree = Self { conn, config, dimension };
+        let tree = Self { conn, config, dimension, path: path.to_string() };
         tree.ensure_root()?;
         Ok(tree)
+    }
+
+    /// Return the database file path.
+    pub fn db_path(&self) -> &str {
+        &self.path
     }
 
     fn ensure_root(&self) -> Result<(), String> {
