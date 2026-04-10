@@ -178,9 +178,11 @@ fn main() {
         }
 
         Commands::Rebalance => {
-            let tree = birch::Tree::open(db_str, 768, birch::Config::default())
+            let embedder = embed::Embedder::new(&ollama_url, &ollama_model)
+                .expect("Ollama not available — is it running?");
+            let tree = birch::Tree::open(db_str, embedder.dimension, birch::Config::default())
                 .expect("cannot open tree");
-            match tree.rebalance() {
+            match tree.rebalance_with_embedder(&embedder) {
                 Ok(msg) => println!("{msg}"),
                 Err(e) => eprintln!("rebalance error: {e}"),
             }
@@ -281,7 +283,7 @@ fn ingest(dir: &std::path::Path, tree: &birch::Tree, embedder: &embed::Embedder,
     println!("ingested {count} entries ({errors} errors) from {}", dir.display());
 
     if count > 0 {
-        match tree.rebalance() {
+        match tree.rebalance_with_embedder(&embedder) {
             Ok(msg) => println!("rebalance: {msg}"),
             Err(e) => eprintln!("rebalance error: {e}"),
         }

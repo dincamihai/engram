@@ -646,11 +646,14 @@ impl Tree {
     }
 
     /// Rebalance the tree: prune ghost nodes, consolidate faded memories, merge small clusters, re-label.
+    /// Rebalance the tree: degrade timestamps, consolidate faded memories,
+    /// prune empty nodes, merge small clusters, re-label leaves.
+    /// Without an embedder, consolidation uses averaged embeddings as fallback.
     pub fn rebalance(&self) -> Result<String, String> {
         let mut merged = 0;
         let mut relabeled = 0;
         let temporal_degraded = self.degrade_temporal_epochs()?;
-        let consolidated = self.consolidate_faded()?;
+        let consolidated = self.consolidate_faded(None)?;
 
         // Prune empty leaf nodes left behind by forget/decay
         let pruned = self.prune_empty_leaves()?;
@@ -680,6 +683,43 @@ impl Tree {
         }
         if consolidated > 0 {
             msg = format!("consolidated {consolidated} faded memories, {msg}");
+        }
+        Ok(msg)
+    }
+
+    /// Rebalance with an embedder for re-embedding consolidated content.
+    /// Consolidated entries get fresh embeddings based on their new content.
+    pub fn rebalance_with_embedder(&self, embedder: &crate::embed::Embedder) -> Result<String, String> {
+        let mut merged = 0;
+        let mut relabeled = 0;
+        let temporal_degraded = self.degrade_temporal_epochs()?;
+        let consolidated = self.consolidate_faded(Some(embedder))?;
+
+        let pruned = self.prune_empty_leaves()?;
+
+        let small_leaves = self.find_small_leaves(3)?;
+        for leaf_id in small_leaves {
+            if self.merge_into_nearest_sibling(leaf_id)? {
+                merged += 1;
+            }
+        }
+
+        let leaves = self.all_leaves()?;
+        for leaf_id in leaves {
+            if self.auto_label(leaf_id)? {
+                relabeled += 1;
+            }
+        }
+
+        let mut msg = format!("merged {merged} small clusters, relabeled {relabeled} nodes");
+        if pruned > 0 {
+            msg = format!("pruned {pruned} empty nodes, {msg}");
+        }
+        if temporal_degraded > 0 {
+            msg = format!("degraded {temporal_degraded} timestamps, {msg}");
+        }
+        if consolidated > 0 {
+            msg = format!("consolidated {consolidated} faded memories (re-embedded), {msg}");
         }
         Ok(msg)
     }
@@ -726,7 +766,10 @@ impl Tree {
 
     /// Consolidate faded memories: group old unaccessed entries by cluster,
     /// merge each group into a single condensed entry.
-    fn consolidate_faded(&self) -> Result<usize, String> {
+    /// When an embedder is provided, the consolidated entry is re-embedded
+    /// and stored through the normal store() pipeline (proper clustering, dedup, etc.).
+    /// Without an embedder, averaged embeddings are used as fallback.
+    fn consolidate_faded(&self, embedder: Option<&crate::embed::Embedder>) -> Result<usize, String> {
         let now = chrono::Utc::now();
         let k: f32 = 0.5;
         let lambda: f32 = 30.0;
@@ -804,7 +847,7 @@ impl Tree {
                 _ => "long ago".to_string(),
             };
 
-            // Compress contents with semantic extraction, average embeddings
+            // Concatenate raw contents, then compress
             let raw_content: String = entries
                 .iter()
                 .map(|(_, c, _, _)| c.as_str())
@@ -820,35 +863,52 @@ impl Tree {
                 &compressed
             };
 
-            // Average embedding
-            let dim = entries[0].2.len();
-            let mut avg = vec![0.0f32; dim];
-            for (_, _, emb, _) in entries {
-                for (i, v) in emb.iter().enumerate() {
-                    avg[i] += v;
-                }
-            }
-            let n = entries.len() as f32;
-            for v in &mut avg {
-                *v /= n;
-            }
-
-            // Insert consolidated entry with display version
-            let (consolidated_display, consolidated_level) = crate::compress::auto_compress(condensed);
-            let consolidated_level_i32 = consolidated_level.as_i32();
-            let epoch = earliest.map(|e| e.timestamp()).unwrap_or_else(|| now.timestamp());
-            self.conn
-                .execute(
-                    "INSERT INTO entries (node_id, content, content_display, compression_level, embedding, source, epoch, temporal_epoch) VALUES (?1, ?2, ?3, ?4, ?5, 'consolidated', ?6, ?6)",
-                    params![node_id, condensed, consolidated_display, consolidated_level_i32, centroid_to_blob(&avg), epoch],
-                )
-                .map_err(|e| format!("insert consolidated: {e}"))?;
-
-            // Delete originals
-            for (id, _, _, _) in entries {
+            // Delete originals first (before store, to avoid dedup issues)
+            let entry_ids: Vec<i64> = entries.iter().map(|(id, _, _, _)| *id).collect();
+            for id in &entry_ids {
                 self.conn
                     .execute("DELETE FROM entries WHERE id = ?1", params![id])
                     .ok();
+            }
+
+            if let Some(emb) = embedder {
+                // Re-embed consolidated content through the full store pipeline
+                // This gives proper clustering, dedup, centroid updates, and splitting
+                match emb.embed(condensed) {
+                    Ok(embedding) => {
+                        let source = Some("consolidated");
+                        let epoch = earliest.map(|e| e.timestamp()).unwrap_or_else(|| now.timestamp());
+                        let dated = format!("{}: {}", date_prefix, condensed);
+                        match self.store(&dated, &embedding, source) {
+                            Ok(_) => {}
+                            Err(e) => eprintln!("consolidate store error: {e}"),
+                        }
+                    }
+                    Err(e) => eprintln!("consolidate embed error: {e}"),
+                }
+            } else {
+                // Fallback: average embeddings and insert directly
+                let dim = entries[0].2.len();
+                let mut avg = vec![0.0f32; dim];
+                for (_, _, emb, _) in entries {
+                    for (i, v) in emb.iter().enumerate() {
+                        avg[i] += v;
+                    }
+                }
+                let n = entries.len() as f32;
+                for v in &mut avg {
+                    *v /= n;
+                }
+
+                let (consolidated_display, consolidated_level) = crate::compress::auto_compress(condensed);
+                let consolidated_level_i32 = consolidated_level.as_i32();
+                let epoch = earliest.map(|e| e.timestamp()).unwrap_or_else(|| now.timestamp());
+                self.conn
+                    .execute(
+                        "INSERT INTO entries (node_id, content, content_display, compression_level, embedding, source, epoch, temporal_epoch) VALUES (?1, ?2, ?3, ?4, ?5, 'consolidated', ?6, ?6)",
+                        params![node_id, condensed, consolidated_display, consolidated_level_i32, centroid_to_blob(&avg), epoch],
+                    )
+                    .map_err(|e| format!("insert consolidated: {e}"))?;
             }
 
             total_consolidated += entries.len();
