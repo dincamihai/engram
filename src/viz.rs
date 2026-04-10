@@ -269,109 +269,71 @@ fn poll_changes(state: &mut VizState, db_path: &str) -> Result<(), Box<dyn std::
     let nodes = tree.all_nodes().map_err(|e| format!("all_nodes: {e}"))?;
     let current_ids: std::collections::HashSet<i64> = nodes.iter().map(|n| n.id).collect();
 
-    // Find new nodes (in DB but not in graph)
-    let new_ids: Vec<i64> = current_ids.difference(&state.known_ids).copied().collect();
-    // Find removed nodes (in graph but not in DB)
-    let removed_ids: Vec<i64> = state.known_ids.difference(&current_ids).copied().collect();
-    // Find changed nodes (count changed)
-    let mut _changed = false;
+    // Detect structural changes (splits, merges, new/removed nodes)
+    let has_new = current_ids.iter().any(|id| !state.known_ids.contains(id));
+    let has_removed = state.known_ids.iter().any(|id| !current_ids.contains(id));
 
-    if new_ids.is_empty() && removed_ids.is_empty() {
-        // Check for count changes on existing nodes — triggers a pulse animation
-        for node_idx in state.graph.node_indices() {
-            let viz_id = state.graph[node_idx].id;
-            if let Some(db_node) = nodes.iter().find(|n| n.id == viz_id) {
-                let old_count = state.graph[node_idx].count;
-                let new_count = db_node.count;
-                if old_count != new_count {
-                    state.graph[node_idx].count = new_count;
-                    let idx_usize = node_idx.index();
-                    if idx_usize < state.animations.len() {
-                        // Growing = blink+pulse, shrinking = blink+shrink
-                        if new_count > old_count {
-                            state.animations.insert(node_idx, NodeAnim::Growing { progress: 0.0 });
-                        } else {
-                            state.animations.insert(node_idx, NodeAnim::Shrinking { progress: 0.0 });
-                        }
-                    }
-                    _changed = true;
+    if has_new || has_removed {
+        // Structural change — full rebuild to get correct PCA, freshness, counts
+        let new_state = build_state(&tree, state.grid_w, state.grid_h)?;
+
+        // Detect which nodes grew/shrank for animations
+        let old_counts: std::collections::HashMap<i64, i64> = state.graph.node_indices()
+            .map(|idx| (state.graph[idx].id, state.graph[idx].count))
+            .collect();
+
+        state.graph = new_state.graph;
+        state.known_ids = new_state.known_ids;
+        state.physics = new_state.physics;
+
+        // Trigger animations for changed/new nodes
+        for idx in state.graph.node_indices() {
+            let node = &state.graph[idx];
+            match old_counts.get(&node.id) {
+                Some(&old_count) if old_count < node.count => {
+                    state.animations.insert(idx, NodeAnim::Growing { progress: 0.0 });
                 }
-                // Also update label if it changed (e.g. after rebalance)
-                if state.graph[node_idx].label != db_node.label {
-                    state.graph[node_idx].label = db_node.label.clone();
-                    _changed = true;
+                Some(&old_count) if old_count > node.count => {
+                    state.animations.insert(idx, NodeAnim::Shrinking { progress: 0.0 });
                 }
+                None => {
+                    // Brand new node
+                    state.animations.insert(idx, NodeAnim::Growing { progress: 0.0 });
+                }
+                _ => {}
             }
         }
-        state.known_ids = current_ids;
-        // No physics ticks — positions are semantic
+
         return Ok(());
     }
 
-    // Add new nodes with Coagulating animation
-    for &id in &new_ids {
-        if let Some(node) = nodes.iter().find(|n| n.id == id) {
-            let access = tree.node_total_access(node.id).unwrap_or(0);
-            let age_hours = tree.node_freshness_hours(node.id)
-                .unwrap_or(None)
-                .unwrap_or(0.0);
-            let freshness = (1.0 / (1.0 + age_hours / 72.0)) as f32;
-            let consolidated = tree.node_consolidated_count(node.id).unwrap_or(0);
-            let unproven = tree.node_unproven_count(node.id).unwrap_or(0);
-
-            // Compute semantic position for new node using same projection
-            // Use centroid dimensions 0 and 1 as simple fallback for new nodes
-            let sx = if node.centroid.len() > 0 { node.centroid[0] as f64 } else { 0.0 };
-            let sy = if node.centroid.len() > 1 { node.centroid[1] as f64 } else { 0.0 };
-
-            let viz_node = VizNode {
-                id: node.id,
-                label: node.label.clone(),
-                count: node.count,
-                depth: node.depth,
-                access,
-                freshness,
-                consolidated,
-                unproven,
-                semantic_x: sx,
-                semantic_y: sy,
-            };
-            let idx = state.graph.add_node(viz_node);
-            // Add edge to parent if parent exists in graph
-            if let Some(parent_id) = node.parent_id {
-                if let Some(parent_idx) = state.graph.node_indices().find(|&ni| state.graph[ni].id == parent_id) {
-                    state.graph.add_edge(parent_idx, idx, ());
+    // No structural change — lightweight update of counts, labels, freshness
+    for node_idx in state.graph.node_indices() {
+        let viz_id = state.graph[node_idx].id;
+        if let Some(db_node) = nodes.iter().find(|n| n.id == viz_id) {
+            let old_count = state.graph[node_idx].count;
+            let new_count = db_node.count;
+            if old_count != new_count {
+                state.graph[node_idx].count = new_count;
+                if new_count > old_count {
+                    state.animations.insert(node_idx, NodeAnim::Growing { progress: 0.0 });
+                } else {
+                    state.animations.insert(node_idx, NodeAnim::Shrinking { progress: 0.0 });
                 }
             }
-            state.animations.insert(idx, NodeAnim::Growing { progress: 0.0 });
-        }
-    }
-
-    // Mark removed nodes as Shrinking
-    for &id in &removed_ids {
-        if let Some(idx) = state.graph.node_indices().find(|&ni| state.graph[ni].id == id) {
-            state.animations.insert(idx, NodeAnim::Shrinking { progress: 0.0 });
-        }
-    }
-
-    state.known_ids = current_ids;
-
-    // Place new nodes at their semantic position
-    for &id in &new_ids {
-        if let Some(idx) = state.graph.node_indices().find(|&ni| state.graph[ni].id == id) {
-            let node = &state.graph[idx];
-            let new_pos = Vec2::new(node.semantic_x * 100.0, node.semantic_y * 100.0);
-
-            // Insert position into physics engine
-            // We need to extend the nodes vec - pad with positions matching graph order
-            let idx_i = idx.index();
-            while state.physics.nodes.len() <= idx_i {
-                state.physics.nodes.push(ascii_petgraph::physics::NodePhysics::new(0.0, 0.0));
+            if state.graph[node_idx].label != db_node.label {
+                state.graph[node_idx].label = db_node.label.clone();
             }
-            state.physics.nodes[idx_i].position = new_pos;
-            state.physics.nodes[idx_i].velocity = Vec2::new(0.0, 0.0);
+            // Update freshness, consolidated, unproven
+            let age_hours = tree.node_freshness_hours(db_node.id)
+                .unwrap_or(None)
+                .unwrap_or(720.0);
+            state.graph[node_idx].freshness = (1.0 / (1.0 + age_hours / 72.0)) as f32;
+            state.graph[node_idx].consolidated = tree.node_consolidated_count(db_node.id).unwrap_or(0);
+            state.graph[node_idx].unproven = tree.node_unproven_count(db_node.id).unwrap_or(0);
         }
     }
+    state.known_ids = current_ids;
 
     Ok(())
 }
