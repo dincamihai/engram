@@ -39,6 +39,9 @@ struct VizNode {
     consolidated: i64,
     /// Number of never-accessed entries (unproven knowledge).
     unproven: i64,
+    /// 2D position from embedding projection (semantic map).
+    semantic_x: f64,
+    semantic_y: f64,
 }
 
 /// Animation state for a node.
@@ -67,6 +70,7 @@ struct VizState {
     pan_x: f64,
     pan_y: f64,
     show_labels: bool,
+    show_edges: bool,
     paused: bool,
     grid_w: usize,
     grid_h: usize,
@@ -118,18 +122,50 @@ fn build_state(tree: &birch::Tree, width: usize, height: usize) -> Result<VizSta
     let mut graph: DiGraph<VizNode, ()> = DiGraph::new();
     let mut node_map: Vec<(i64, petgraph::graph::NodeIndex)> = Vec::new();
 
-    // Add nodes with freshness
+    // PCA-like 2D projection of centroids:
+    // 1. Compute mean centroid
+    let dim = nodes[0].centroid.len();
+    let n = nodes.len() as f64;
+    let mut mean = vec![0.0f64; dim];
     for node in &nodes {
+        for (i, v) in node.centroid.iter().enumerate() {
+            mean[i] += *v as f64 / n;
+        }
+    }
+
+    // 2. Find the two dimensions with highest variance
+    let mut variance = vec![0.0f64; dim];
+    for node in &nodes {
+        for (i, v) in node.centroid.iter().enumerate() {
+            let d = *v as f64 - mean[i];
+            variance[i] += d * d / n;
+        }
+    }
+    let mut dim_indices: Vec<usize> = (0..dim).collect();
+    dim_indices.sort_by(|&a, &b| variance[b].partial_cmp(&variance[a]).unwrap_or(std::cmp::Ordering::Equal));
+    let dim_x = dim_indices[0];
+    let dim_y = if dim_indices.len() > 1 { dim_indices[1] } else { 0 };
+
+    // 3. Project each node to 2D using top-2 variance dimensions
+    let projections: Vec<(f64, f64)> = nodes.iter()
+        .map(|node| {
+            let x = node.centroid[dim_x] as f64 - mean[dim_x];
+            let y = node.centroid[dim_y] as f64 - mean[dim_y];
+            (x, y)
+        })
+        .collect();
+
+    // Add nodes with freshness + semantic position
+    for (i, node) in nodes.iter().enumerate() {
         let access = tree.node_total_access(node.id).unwrap_or(0);
-        // Convert age in hours to freshness 0.0–1.0
-        // 0 hours = 1.0 (just touched), 168 hours (1 week) = ~0.5, 720h (1 month) ≈ 0.15
         let age_hours = tree.node_freshness_hours(node.id)
             .unwrap_or(None)
             .unwrap_or(720.0);
-        let freshness = (1.0 / (1.0 + age_hours / 72.0)) as f32; // half-life = 3 days
+        let freshness = (1.0 / (1.0 + age_hours / 72.0)) as f32;
 
         let consolidated = tree.node_consolidated_count(node.id).unwrap_or(0);
         let unproven = tree.node_unproven_count(node.id).unwrap_or(0);
+        let (sx, sy) = projections[i];
         let viz_node = VizNode {
             id: node.id,
             label: node.label.clone(),
@@ -139,6 +175,8 @@ fn build_state(tree: &birch::Tree, width: usize, height: usize) -> Result<VizSta
             freshness,
             consolidated,
             unproven,
+            semantic_x: sx,
+            semantic_y: sy,
         };
         let idx = graph.add_node(viz_node);
         node_map.push((node.id, idx));
@@ -155,23 +193,30 @@ fn build_state(tree: &birch::Tree, width: usize, height: usize) -> Result<VizSta
         }
     }
 
-    // Setup physics engine — tuned for tree layout (compact)
+    // Setup physics engine (still needed for the data structure, but positions are semantic)
     let physics_config = PhysicsConfig {
-        spring_constant: 0.12,
-        spring_length: 35.0,       // shorter edges — tighter tree
-        repulsion_constant: 3000.0, // less repulsion — nodes stay closer
+        spring_constant: 0.0,
+        spring_length: 0.0,
+        repulsion_constant: 0.0,
         gravity: 0.0,
-        damping: 0.85,
+        damping: 0.99,
         dt: 1.0,
-        velocity_threshold: 0.1,
-        max_iterations: 5000,
+        velocity_threshold: 0.01,
+        max_iterations: 0,
     };
     let mut physics = PhysicsEngine::new(&graph, physics_config);
-    physics.normalize_positions();
 
-    // Run initial ticks so nodes spread out
-    for _ in 0..20 {
-        physics.tick(&graph);
+    // Seed positions from semantic projection — deterministic, no simulation needed
+    for node_idx in graph.node_indices() {
+        let node = &graph[node_idx];
+        let i = node_idx.index();
+        if i < physics.nodes.len() {
+            physics.nodes[i].position = ascii_petgraph::physics::Vec2::new(
+                node.semantic_x * 100.0, // scale up for screen space
+                node.semantic_y * 100.0,
+            );
+            physics.nodes[i].velocity = ascii_petgraph::physics::Vec2::new(0.0, 0.0);
+        }
     }
     physics.normalize_positions();
 
@@ -192,6 +237,7 @@ fn build_state(tree: &birch::Tree, width: usize, height: usize) -> Result<VizSta
         pan_x: 0.0,
         pan_y: 0.0,
         show_labels: false,
+        show_edges: false,
         paused: false,
         grid_w: width,
         grid_h: height,
@@ -216,7 +262,7 @@ fn poll_changes(state: &mut VizState, db_path: &str) -> Result<(), Box<dyn std::
     // Find removed nodes (in graph but not in DB)
     let removed_ids: Vec<i64> = state.known_ids.difference(&current_ids).copied().collect();
     // Find changed nodes (count changed)
-    let mut changed = false;
+    let mut _changed = false;
 
     if new_ids.is_empty() && removed_ids.is_empty() {
         // Check for count changes on existing nodes — triggers a pulse animation
@@ -236,22 +282,17 @@ fn poll_changes(state: &mut VizState, db_path: &str) -> Result<(), Box<dyn std::
                             state.animations.insert(node_idx, NodeAnim::Shrinking { progress: 0.0 });
                         }
                     }
-                    changed = true;
+                    _changed = true;
                 }
                 // Also update label if it changed (e.g. after rebalance)
                 if state.graph[node_idx].label != db_node.label {
                     state.graph[node_idx].label = db_node.label.clone();
-                    changed = true;
+                    _changed = true;
                 }
             }
         }
         state.known_ids = current_ids;
-        if changed {
-            // Small nudge: give a few physics ticks to absorb the change
-            for _ in 0..3 {
-                state.physics.tick(&state.graph);
-            }
-        }
+        // No physics ticks — positions are semantic
         return Ok(());
     }
 
@@ -265,6 +306,12 @@ fn poll_changes(state: &mut VizState, db_path: &str) -> Result<(), Box<dyn std::
             let freshness = (1.0 / (1.0 + age_hours / 72.0)) as f32;
             let consolidated = tree.node_consolidated_count(node.id).unwrap_or(0);
             let unproven = tree.node_unproven_count(node.id).unwrap_or(0);
+
+            // Compute semantic position for new node using same projection
+            // Use centroid dimensions 0 and 1 as simple fallback for new nodes
+            let sx = if node.centroid.len() > 0 { node.centroid[0] as f64 } else { 0.0 };
+            let sy = if node.centroid.len() > 1 { node.centroid[1] as f64 } else { 0.0 };
+
             let viz_node = VizNode {
                 id: node.id,
                 label: node.label.clone(),
@@ -274,6 +321,8 @@ fn poll_changes(state: &mut VizState, db_path: &str) -> Result<(), Box<dyn std::
                 freshness,
                 consolidated,
                 unproven,
+                semantic_x: sx,
+                semantic_y: sy,
             };
             let idx = state.graph.add_node(viz_node);
             // Add edge to parent if parent exists in graph
@@ -295,33 +344,11 @@ fn poll_changes(state: &mut VizState, db_path: &str) -> Result<(), Box<dyn std::
 
     state.known_ids = current_ids;
 
-    // Instead of rebuilding physics, add new node positions near their parents
-    // and let the existing simulation absorb them
+    // Place new nodes at their semantic position
     for &id in &new_ids {
         if let Some(idx) = state.graph.node_indices().find(|&ni| state.graph[ni].id == id) {
-            // Find parent position and place new node nearby
-            let parent_pos = state.graph.neighbors_directed(idx, petgraph::Direction::Incoming)
-                .next()
-                .and_then(|pidx| {
-                    let p_i = pidx.index();
-                    if p_i < state.physics.nodes.len() {
-                        Some(state.physics.nodes[p_i].position)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_else(|| {
-                    // No parent or parent not found: random position near center
-                    let angle = (id as f64).to_radians();
-                    Vec2::new(angle.cos() * 50.0, angle.sin() * 50.0)
-                });
-
-            // Place near parent with small random offset
-            let offset = Vec2::new(
-                ((id * 17) % 20) as f64 - 10.0,
-                ((id * 31) % 20) as f64 - 10.0,
-            );
-            let new_pos = parent_pos + offset;
+            let node = &state.graph[idx];
+            let new_pos = Vec2::new(node.semantic_x * 100.0, node.semantic_y * 100.0);
 
             // Insert position into physics engine
             // We need to extend the nodes vec - pad with positions matching graph order
@@ -411,11 +438,7 @@ fn run_loop(
         // Remove fully dispersed nodes
         remove_dispersed(&mut state);
 
-        // Physics step
-        if !state.paused && !state.physics.is_stable() {
-            state.physics.tick(&state.graph);
-            state.physics.normalize_positions();
-        }
+        // No physics simulation — positions are semantic (deterministic from embeddings)
 
         // Poll DB for changes every 2 seconds
         if state.last_poll.elapsed() >= Duration::from_secs(1) {
@@ -463,6 +486,7 @@ fn run_loop(
                         KeyCode::Left => state.pan_x -= 10.0,
                         KeyCode::Right => state.pan_x += 10.0,
                         KeyCode::Char('l') => state.show_labels = !state.show_labels,
+                        KeyCode::Char('e') => state.show_edges = !state.show_edges,
                         KeyCode::Char(' ') => state.paused = !state.paused,
                         _ => {}
                     }
@@ -598,7 +622,8 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
         })
         .collect();
 
-    // Draw edges with traveling pulse — energy flows from parent to child
+    // Draw edges (hidden by default, toggle with 'e')
+    if state.show_edges {
     for edge in state.graph.edge_references() {
         let source_pos = state.physics.position(edge.source());
         let target_pos = state.physics.position(edge.target());
@@ -614,7 +639,7 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
         let src_color = freshness_color(state.graph[edge.source()].freshness, src_leaf);
         let tgt_color = freshness_color(state.graph[edge.target()].freshness, tgt_leaf);
 
-        // Draw edge with color gradient from source → target freshness
+        // Single-pixel edge with color gradient
         let steps = ((x2 - x1).abs().max((y2 - y1).abs())) as usize;
         let steps = steps.max(1);
         for s in 0..=steps {
@@ -622,16 +647,16 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
             let ex = (x1 as f64 + (x2 - x1) as f64 * t).round() as usize;
             let ey = (y1 as f64 + (y2 - y1) as f64 * t).round() as usize;
             if ex >= state.grid_w * 2 || ey >= state.grid_h * 4 { continue; }
-
             let edge_color = DotColor::rgb(
-                ((src_color.r as f64 * (1.0 - t) + tgt_color.r as f64 * t) * 0.7) as u8,
-                ((src_color.g as f64 * (1.0 - t) + tgt_color.g as f64 * t) * 0.7) as u8,
-                ((src_color.b as f64 * (1.0 - t) + tgt_color.b as f64 * t) * 0.7) as u8,
+                ((src_color.r as f64 * (1.0 - t) + tgt_color.r as f64 * t) * 0.5) as u8,
+                ((src_color.g as f64 * (1.0 - t) + tgt_color.g as f64 * t) * 0.5) as u8,
+                ((src_color.b as f64 * (1.0 - t) + tgt_color.b as f64 * t) * 0.5) as u8,
             );
             state.grid.set_dot(ex, ey).ok();
             state.grid.set_cell_color(ex / 2, ey / 4, edge_color).ok();
         }
     }
+    } // end show_edges
 
     // Draw particle trails — fading dots behind moving nodes
     let max_trail = 12usize;
@@ -674,6 +699,88 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
                 state.grid.set_dot(tx, ty).ok();
                 state.grid.set_cell_color(tx / 2, ty / 4, trail_color).ok();
             }
+        }
+    }
+
+    // Draw atmosphere around all nodes — color encodes cluster health
+    // Leaf nodes: health from own freshness + proven ratio
+    // Structural nodes: average health of their children
+    for node_idx in state.graph.node_indices() {
+        let node = &state.graph[node_idx];
+        let is_leaf = leaf_nodes.contains(&node_idx);
+
+        let pos = state.physics.position(node_idx);
+        let (px, py) = to_pixel(pos);
+        if px < 0 || py < 0 { continue; }
+        let ux = px as usize;
+        let uy = py as usize;
+        if ux >= state.grid_w * 2 || uy >= state.grid_h * 4 { continue; }
+
+        // Health score: 0.0 = danger, 1.0 = healthy
+        let health = if is_leaf {
+            if node.count <= 0 { continue; }
+            let proven_ratio = 1.0 - (node.unproven as f64 / node.count as f64);
+            (node.freshness as f64 * 0.5 + proven_ratio * 0.5).clamp(0.0, 1.0)
+        } else {
+            // Structural: average health of child nodes
+            let children: Vec<NodeIndex> = state.graph
+                .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
+                .collect();
+            if children.is_empty() { continue; }
+            let sum: f64 = children.iter().map(|&c| {
+                let cn = &state.graph[c];
+                let pr = if cn.count > 0 { 1.0 - (cn.unproven as f64 / cn.count as f64) } else { 1.0 };
+                (cn.freshness as f64 * 0.5 + pr * 0.5).clamp(0.0, 1.0)
+            }).sum();
+            sum / children.len() as f64
+        };
+
+        // Color: teal (healthy) → amber (warning) → magenta (danger)
+        // Chosen for contrast on dark terminals
+        let atmo_color = if health > 0.6 {
+            // Teal/cyan — healthy, calm
+            DotColor::rgb(40, 200, 180)
+        } else if health > 0.3 {
+            // Amber/orange — warning
+            DotColor::rgb(240, 180, 50)
+        } else {
+            // Magenta/pink — danger, visible on dark bg
+            DotColor::rgb(240, 60, 140)
+        };
+
+        // Atmosphere is steady — only brightens when the node is animating (add/delete)
+        let anim = state.animations.get(&node_idx).unwrap_or(&NodeAnim::Stable);
+        let breath = match anim {
+            NodeAnim::Growing { progress } => 0.8 + 0.4 * ((progress * std::f32::consts::PI * 4.0).sin() as f64).abs(),
+            NodeAnim::Shrinking { progress } => 0.8 + 0.4 * ((progress * std::f32::consts::PI * 4.0).sin() as f64).abs(),
+            _ => 0.7, // steady baseline
+        };
+
+        // Atmosphere radius based on node size
+        let count_size = 1 + ((node.count as f64).ln().max(0.0) / 1.5) as usize;
+        let atmo_radius = (count_size as f64 + 5.0 + (node.count as f64).sqrt() * 2.0) as usize;
+
+        // Draw dense cloud of dots filling the atmosphere area
+        let num_atmo_dots = 40 + node.count.min(30) as usize * 3;
+        for i in 0..num_atmo_dots {
+            // Distribute dots across the full disk, denser toward the edge
+            let angle = (i as f64 / num_atmo_dots as f64) * std::f64::consts::TAU
+                + (node.id as f64 * 0.5) + (i as f64 * 1.618); // golden ratio scatter
+            let r_variation = 0.3 + 0.7 * ((i as f64 * 2.7 + state.frame as f64 * 0.005).sin() * 0.5 + 0.5);
+            let r = atmo_radius as f64 * r_variation;
+
+            let ax = (ux as f64 + r * angle.cos()).round() as usize;
+            let ay = (uy as f64 + r * angle.sin()).round() as usize;
+            if ax >= state.grid_w * 2 || ay >= state.grid_h * 4 { continue; }
+
+            // Apply breathing to atmosphere brightness
+            let dot_color = DotColor::rgb(
+                (atmo_color.r as f64 * breath * 0.6) as u8,
+                (atmo_color.g as f64 * breath * 0.6) as u8,
+                (atmo_color.b as f64 * breath * 0.6) as u8,
+            );
+            state.grid.set_dot(ax, ay).ok();
+            state.grid.set_cell_color(ax / 2, ay / 4, dot_color).ok();
         }
     }
 
@@ -763,28 +870,31 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
             let inner_radius = (dot_size as f64) + 3.0 + (node.count as f64).sqrt() * 1.2;
             let outer_radius = inner_radius * 1.8; // unproven orbit 80% further out
 
-            // Orbit speed scales with freshness: fresh = lively, old = nearly frozen
-            let orbit_speed = 0.002 + 0.02 * node.freshness as f64; // 0.002 (static) → 0.022 (fast)
-            let orbit_base = state.frame as f64 * orbit_speed + (node.id as f64 * 0.7);
-            // Wobble amplitude also scales: fresh = organic wobble, old = rigid
-            let wobble_amp = 0.02 + 0.15 * node.freshness as f64;
+            // Entropy/temperature: fresh = hot vibrating particles, old = cooled, still
+            let temperature = node.freshness as f64; // 0.0 (frozen) → 1.0 (boiling)
+            let jitter_amp = 0.5 + temperature * 4.0; // 0.5px (cold) → 4.5px (hot)
 
             for i in 0..total_points {
                 // Classify: proven first, then unproven, then consolidated
                 let is_unproven = i >= proven_count && i < proven_count + unproven_count;
                 let is_consolidated = i >= proven_count + unproven_count;
 
-                let base_angle = (i as f64 / total_points as f64) * std::f64::consts::TAU;
-                let speed = 1.0 + (i as f64 * 0.1);
-                let angle = base_angle + orbit_base * speed;
-                let wobble = 1.0 + wobble_amp * ((orbit_base * 2.0 + i as f64 * 1.3).sin());
+                // Fixed base position on a ring (deterministic, no orbit)
+                let base_angle = (i as f64 / total_points as f64) * std::f64::consts::TAU
+                    + (node.id as f64 * 0.7); // per-node offset
 
-                // Proven = inner orbit, unproven = outer orbit, consolidated = inner
+                // Proven = inner, unproven = outer, consolidated = inner
                 let base_r = if is_unproven { outer_radius } else { inner_radius };
-                let r = base_r * wobble;
 
-                let cx = ux as f64 + (dot_size as f64 / 2.0) + r * angle.cos();
-                let cy = uy as f64 + (dot_size as f64 / 2.0) + r * angle.sin();
+                // Brownian jitter: random-looking vibration from fast sin/cos with unique seeds
+                let seed = i as f64 * 7.3 + node.id as f64 * 3.1;
+                let jx = jitter_amp * (state.frame as f64 * 0.15 + seed).sin()
+                       * (state.frame as f64 * 0.23 + seed * 1.7).cos();
+                let jy = jitter_amp * (state.frame as f64 * 0.19 + seed * 2.3).cos()
+                       * (state.frame as f64 * 0.13 + seed * 0.9).sin();
+
+                let cx = ux as f64 + (dot_size as f64 / 2.0) + base_r * base_angle.cos() + jx;
+                let cy = uy as f64 + (dot_size as f64 / 2.0) + base_r * base_angle.sin() + jy;
 
                 if is_consolidated {
                     // Draw clump: 3 dots stuck together in a tight triangle
@@ -807,7 +917,7 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
                     let sx = cx.round() as usize;
                     let sy = cy.round() as usize;
                     if sx < state.grid_w * 2 && sy < state.grid_h * 4 {
-                        let sat_bright = 0.5 + 0.5 * ((angle * 2.0).sin()).abs();
+                        let sat_bright = 0.5 + 0.5 * ((base_angle * 2.0 + state.frame as f64 * 0.1).sin()).abs();
                         let sat_color = DotColor::rgb(
                             (base_depth_color.r as f64 * (0.5 + 0.5 * sat_bright)) as u8,
                             (base_depth_color.g as f64 * (0.5 + 0.5 * sat_bright)) as u8,
@@ -886,11 +996,10 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
         .map(|idx| state.graph[idx].count)
         .sum();
     let status = format!(
-        " nodes:{} entries:{} zoom:{:.1}x {} anims:{} [q]uit [r]eset [+/-]zoom [arrows]pan [l]abels [space]pause ",
+        " nodes:{} entries:{} zoom:{:.1}x anims:{} [q]uit [+/-]zoom [arrows]pan [l]abels [e]dges ",
         state.graph.node_count(),
         total_entries,
         state.zoom,
-        if state.paused { "PAUSED" } else if state.physics.is_stable() { "STABLE" } else { "SETTLING" },
         anim_count,
     );
     let status_widget = ratatui::widgets::Paragraph::new(
