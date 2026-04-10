@@ -178,50 +178,67 @@ These behaviors aren't coded as features — they emerge from the interaction be
 
 ## Claude Code Hooks
 
-Engram integrates with Claude Code's hook system to provide autoMemory-like behavior — automatic recall at session start and memory nudges during work.
+Engram integrates with Claude Code's hook system for automatic memory injection and storage — the agent doesn't need to explicitly call engram tools, memories just appear and get saved.
 
 ### SessionStart — Memory Injection
 
-A `SessionStart` hook searches engram using the current month and date as a query bias, returning the most relevant recent memories and injecting them as context at the start of every session.
-
-**Trick:** Entries are prefixed with timestamps (e.g., `2026-04-08:`). Passing a date string as part of the search query biases semantic similarity toward memories from that time period. Use recent dates for current context, older dates for distant recall.
+Injects relevant memories at the start of every session using the current date and working directory as query bias. Results are already compressed (caveman for prose, structural for code) for maximum information density.
 
 ```bash
 #!/bin/bash
+WORKDIR=$(basename "$PWD")
 TODAY=$(date +%Y-%m-%d)
 MONTH=$(date +"%B %Y")
-QUERY="$MONTH recent work context $TODAY"
-RESULT=$(engram search "$QUERY" --limit 10 2>/dev/null | head -100)
+QUERY="$MONTH recent work context $TODAY $WORKDIR"
+RESULT=$(engram search "$QUERY" --limit 10 2>/dev/null | head -120)
 if [ -n "$RESULT" ]; then
   ESCAPED=$(echo "$RESULT" | python3 -c "import sys,json; s=json.dumps(sys.stdin.read()); print(s[1:-1])")
   echo "{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"== Engram Memory (auto-loaded) ==\n${ESCAPED}\n== End Engram Memory ==\"}}"
 fi
 ```
 
-### PreCompact — Save Before Compaction
+### PostToolUse — Auto-store and Activate
 
-A `PreCompact` hook fires before Claude Code compacts the conversation context. It injects a reminder to review the conversation and save important information (decisions, outcomes, patterns) to engram before context is lost.
+After significant tool results (Bash, Agent), this hook:
+1. **Stores** the result in engram (background)
+2. **Activates** relevant memories based on the result and injects them as context
 
 ```bash
 #!/bin/bash
-echo '{"hookSpecificOutput":{"hookEventName":"PreCompact","additionalContext":"Context is about to be compacted. Save any important information to engram memory before proceeding."}}'
+INPUT=$(cat)
+TOOL=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tool_name',''))")
+RESULT=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); r=d.get('result',''); print(r[:2000])")
+
+case "$TOOL" in
+    Bash|Agent)
+        if [ -n "$RESULT" ]; then
+            engram store "$RESULT" --source "claude-code-hook" 2>/dev/null &
+            CONTEXT=$(engram search "$RESULT" --limit 5 2>/dev/null | head -60)
+            if [ -n "$CONTEXT" ]; then
+                # Inject activated memories as context
+                ...
+            fi
+        fi
+        ;;
+esac
 ```
 
-### PostToolUse — Work Completion Nudges
+### PreCompact — Save Before Compaction
 
-PostToolUse hooks nudge Claude to consider saving memories after significant work. For example, matching Bash commands containing `git push`, `git commit`, or CI/CD tool invocations:
+Stores the conversation summary before compaction and approves the compaction. No information is lost — the summary is saved to engram.
 
-```json
-{
-  "matcher": "Bash",
-  "hooks": [{
-    "type": "command",
-    "command": "jq -r '.tool_input.command' | grep -qE 'git (push|commit)' && echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"Significant work detected. Consider saving memories via engram_store.\"}}' || true"
-  }]
-}
+```bash
+#!/bin/bash
+SUMMARY=$(cat)
+if [ -n "$SUMMARY" ]; then
+    engram store "$SUMMARY" --source "claude-code-compact" 2>/dev/null &
+fi
+echo '{"decision":"approve"}'
 ```
 
-Similarly, an Edit matcher can fire after editing files in specific directories (e.g., a notes vault).
+### Stop — Session End
+
+Stores the final session context on conversation stop.
 
 ### Hook Configuration
 
