@@ -11,7 +11,8 @@ use ascii_petgraph::physics::{PhysicsConfig, PhysicsEngine, Vec2};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use dotmax::primitives::draw_line;
+use dotmax::grid::Color as DotColor;
+use dotmax::primitives::{draw_line, draw_line_colored};
 use dotmax::BrailleGrid;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
@@ -37,17 +38,17 @@ struct VizNode {
 /// Animation state for a node.
 #[derive(Debug, Clone)]
 enum NodeAnim {
-    /// Node was added — blink yellow/blue for `frames_left` frames.
+    /// Node was added — green color fading to normal.
     Growing { progress: f32 },
-    /// Node lost entries — blink yellow/red for `frames_left` frames.
+    /// Node lost entries — red color fading out.
     Shrinking { progress: f32 },
-    /// Branch vibration — node shakes slightly (triggered on child changes).
+    /// Branch vibration — node shakes slightly (reserved for future use).
     Vibrating { progress: f32 },
     /// Normal, stable.
     Stable,
 }
 
-const ANIM_SPEED: f32 = 0.02; // progress per frame (~1.7s at 30fps for full cycle)
+const ANIM_SPEED: f32 = 0.008; // progress per frame (~4s at 30fps for full cycle)
 const VIBRATE_AMPLITUDE: f64 = 3.0; // pixels of shake
 
 /// State for the visualization.
@@ -151,7 +152,8 @@ fn build_state(tree: &birch::Tree, width: usize, height: usize) -> Result<VizSta
     }
     physics.normalize_positions();
 
-    let grid = BrailleGrid::new(width, height)?;
+    let mut grid = BrailleGrid::new(width, height)?;
+    grid.enable_color_support();
 
     // All initial nodes are stable
     let animations: HashMap<NodeIndex, NodeAnim> = graph.node_indices()
@@ -205,10 +207,8 @@ fn poll_changes(state: &mut VizState, db_path: &str) -> Result<(), Box<dyn std::
                         // Growing = blink+pulse, shrinking = blink+shrink
                         if new_count > old_count {
                             state.animations.insert(node_idx, NodeAnim::Growing { progress: 0.0 });
-                            vibrate_branch(&state.graph, node_idx, &mut state.animations);
                         } else {
                             state.animations.insert(node_idx, NodeAnim::Shrinking { progress: 0.0 });
-                            vibrate_branch(&state.graph, node_idx, &mut state.animations);
                         }
                     }
                     changed = true;
@@ -337,24 +337,6 @@ fn remove_dispersed(state: &mut VizState) {
 
 /// Vibrate the branch (parent and siblings) of a changed node.
 /// Only applies Vibrating to nodes that are currently Stable (doesn't override Growing/Shrinking).
-fn vibrate_branch(graph: &DiGraph<VizNode, ()>, node_idx: NodeIndex, animations: &mut HashMap<NodeIndex, NodeAnim>) {
-    // Vibrate parent
-    if let Some(parent) = graph.neighbors_directed(node_idx, petgraph::Direction::Incoming).next() {
-        if matches!(animations.get(&parent), Some(NodeAnim::Stable) | None) {
-            animations.insert(parent, NodeAnim::Vibrating { progress: 0.0 });
-        }
-    }
-    // Vibrate siblings (but not the node itself — it already has Growing/Shrinking)
-    if let Some(parent) = graph.neighbors_directed(node_idx, petgraph::Direction::Incoming).next() {
-        for sibling in graph.neighbors_directed(parent, petgraph::Direction::Outgoing) {
-            if sibling != node_idx {
-                if matches!(animations.get(&sibling), Some(NodeAnim::Stable) | None) {
-                    animations.insert(sibling, NodeAnim::Vibrating { progress: 0.0 });
-                }
-            }
-        }
-    }
-}
 
 /// Advance animation progress by one frame.
 fn tick_animations(state: &mut VizState) {
@@ -402,7 +384,7 @@ fn run_loop(
         }
 
         // Poll DB for changes every 2 seconds
-        if state.last_poll.elapsed() >= Duration::from_secs(2) {
+        if state.last_poll.elapsed() >= Duration::from_secs(1) {
             if let Err(e) = poll_changes(&mut state, db_path) {
                 // Don't crash on poll errors, just log
                 eprintln!("[engram viz] poll error: {e}");
@@ -451,9 +433,9 @@ fn run_loop(
         let new_h = size.height as usize;
         if new_w != state.grid_w || new_h != state.grid_h {
             if new_w > 2 && new_h > 2 {
-                state.grid = BrailleGrid::new(new_w, new_h)?;
-                state.grid_w = new_w;
-                state.grid_h = new_h;
+                let mut new_grid = BrailleGrid::new(new_w, new_h)?;
+                new_grid.enable_color_support();
+                state.grid = new_grid;
             }
         }
     }
@@ -462,6 +444,7 @@ fn run_loop(
 fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
     let area = frame.area();
     state.grid.clear();
+    state.grid.clear_colors();
 
     // Braille grid pixel dimensions (2 wide x 4 tall per character)
     let grid_pixel_w = (state.grid_w * 2) as f64;
@@ -502,7 +485,45 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
         (px.round() as i32, py.round() as i32)
     };
 
-    // Draw edges
+    // Determine node colors based on animation state
+    let node_colors: HashMap<NodeIndex, Option<DotColor>> = state.graph.node_indices()
+        .map(|idx| {
+            let anim = state.animations.get(&idx).unwrap_or(&NodeAnim::Stable);
+            let color = match anim {
+                NodeAnim::Growing { progress } => {
+                    // Bright green fading to default as progress → 1
+                    let t = *progress;
+                    Some(DotColor::rgb(
+                        (30.0 + 170.0 * t) as u8,   // R: 30 → 200
+                        (255.0 - 55.0 * t) as u8,    // G: 255 → 200
+                        (50.0 + 150.0 * t) as u8,    // B: 50 → 200
+                    ))
+                }
+                NodeAnim::Shrinking { progress } => {
+                    // Bright red fading to dim as progress → 1
+                    let t = *progress;
+                    Some(DotColor::rgb(
+                        (255.0 * (1.0 - t * 0.7)) as u8, // R: 255 → 76
+                        (40.0 * (1.0 - t)) as u8,         // G: 40 → 0
+                        (20.0 * (1.0 - t)) as u8,          // B: 20 → 0
+                    ))
+                }
+                NodeAnim::Vibrating { progress } => {
+                    // Subtle blue tint
+                    let t = *progress;
+                    Some(DotColor::rgb(
+                        (100.0 + 80.0 * t) as u8,
+                        (100.0 + 80.0 * t) as u8,
+                        (200.0 - 20.0 * t) as u8,
+                    ))
+                }
+                NodeAnim::Stable => None,
+            };
+            (idx, color)
+        })
+        .collect();
+
+    // Draw edges — colored if either endpoint is animated
     for edge in state.graph.edge_references() {
         let source_pos = state.physics.position(edge.source());
         let target_pos = state.physics.position(edge.target());
@@ -516,56 +537,34 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
             && (x2 as usize) < state.grid_w * 2
             && (y2 as usize) < state.grid_h * 4
         {
-            draw_line(&mut state.grid, x1, y1, x2, y2).ok();
+            // Color edge if either endpoint is animated
+            let edge_color = node_colors.get(&edge.source())
+                .or_else(|| node_colors.get(&edge.target()))
+                .and_then(|c| *c);
+
+            if let Some(color) = edge_color {
+                draw_line_colored(&mut state.grid, x1, y1, x2, y2, color, None).ok();
+            } else {
+                draw_line(&mut state.grid, x1, y1, x2, y2).ok();
+            }
         }
     }
 
-    // Draw nodes as braille dots with animation
+    // Draw nodes as braille dots with color
     for node_idx in state.graph.node_indices() {
         let pos = state.physics.position(node_idx);
         let (mut px, mut py) = to_pixel(pos);
         let node = &state.graph[node_idx];
-        let i = node_idx.index();
 
-        // Bounds check (braille pixels)
-        if px < 0 || py < 0 {
-            continue;
-        }
-
-        // Apply animation effects
+        // Apply vibration offset if vibrating
         let anim = state.animations.get(&node_idx).unwrap_or(&NodeAnim::Stable);
-        let mut visible = true;
-        let mut size_boost = 0usize;
-
-        match anim {
-            NodeAnim::Growing { progress } => {
-                // Blink: alternate visibility (visible ~70% of time)
-                let phase = (*progress * 12.0_f32).sin();
-                if phase < -0.5 {
-                    visible = false;
-                }
-                // Size pulse: starts big then settles
-                size_boost = ((1.0 - *progress) * 3.0) as usize;
-            }
-            NodeAnim::Shrinking { progress } => {
-                // Blink: alternate visibility (slower)
-                let phase = (*progress * 10.0_f32).sin();
-                if phase < -0.3 {
-                    visible = false;
-                }
-                // Shrink over time
-                size_boost = 0;
-            }
-            NodeAnim::Vibrating { progress } => {
-                // Small position jitter
-                let phase = *progress as f64 * 20.0;
-                px += (phase.sin() * VIBRATE_AMPLITUDE) as i32;
-                py += (phase.cos() * VIBRATE_AMPLITUDE) as i32;
-            }
-            NodeAnim::Stable => {}
+        if let NodeAnim::Vibrating { progress } = anim {
+            let phase = *progress as f64 * 20.0;
+            px += (phase.sin() * VIBRATE_AMPLITUDE) as i32;
+            py += (phase.cos() * VIBRATE_AMPLITUDE) as i32;
         }
 
-        if !visible || px < 0 || py < 0 {
+        if px < 0 || py < 0 {
             continue;
         }
         let ux = px as usize;
@@ -574,14 +573,27 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
             continue;
         }
 
-        let dot_size = if node.depth == 0 { 3 + size_boost } else { 1 + size_boost };
+        let node_color = node_colors.get(&node_idx).and_then(|c| *c);
+        // Animated nodes get a size pulse for extra visibility
+        let anim_boost = match anim {
+            NodeAnim::Growing { progress } => ((1.0 - *progress) * 2.0) as usize,
+            NodeAnim::Shrinking { progress } => ((1.0 - *progress) * 1.5) as usize,
+            _ => 0,
+        };
+        let dot_size = if node.depth == 0 { 3 + anim_boost } else { 1 + anim_boost };
 
         for dx in 0..dot_size {
-            for dy in 0..dot_size.min(2 + size_boost) {
+            for dy in 0..dot_size.min(2) {
                 let nx = ux + dx;
                 let ny = uy + dy;
                 if nx < state.grid_w * 2 && ny < state.grid_h * 4 {
                     state.grid.set_dot(nx, ny).ok();
+                    if let Some(color) = node_color {
+                        // Braille pixel (nx, ny) → cell (nx/2, ny/4)
+                        let cell_x = nx / 2;
+                        let cell_y = ny / 4;
+                        state.grid.set_cell_color(cell_x, cell_y, color).ok();
+                    }
                 }
             }
         }
@@ -590,23 +602,41 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
         if node.count > 5 && dot_size <= 1 {
             if ux + 1 < state.grid_w * 2 {
                 state.grid.set_dot(ux + 1, uy).ok();
+                if let Some(color) = node_color {
+                    state.grid.set_cell_color((ux + 1) / 2, uy / 4, color).ok();
+                }
             }
             if uy + 1 < state.grid_h * 4 {
                 state.grid.set_dot(ux, uy + 1).ok();
+                if let Some(color) = node_color {
+                    state.grid.set_cell_color(ux / 2, (uy + 1) / 4, color).ok();
+                }
             }
         }
     }
 
-    // Render braille grid to string
+    // Build styled text from grid (chars + colors)
     let unicode_grid = state.grid.to_unicode_grid();
-    let text: String = unicode_grid
-        .iter()
-        .map(|row| row.iter().collect::<String>())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let paragraph = ratatui::text::Text::from(text);
-    frame.render_widget(paragraph, area);
+    let mut lines: Vec<ratatui::text::Line> = Vec::with_capacity(state.grid_h);
+    for y in 0..state.grid_h {
+        let mut spans: Vec<ratatui::text::Span> = Vec::with_capacity(state.grid_w);
+        for x in 0..state.grid_w {
+            let ch = unicode_grid[y][x];
+            let dot_color = state.grid.get_color(x, y);
+            let span = if let Some(c) = dot_color {
+                Span::styled(
+                    ch.to_string(),
+                    Style::default().fg(Color::Rgb(c.r, c.g, c.b)),
+                )
+            } else {
+                Span::raw(ch.to_string())
+            };
+            spans.push(span);
+        }
+        lines.push(ratatui::text::Line::from(spans));
+    }
+    let text = ratatui::text::Text::from(lines);
+    frame.render_widget(text, area);
 
     // Overlay labels if enabled
     if state.show_labels {
@@ -625,9 +655,14 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
                         node.label.clone()
                     };
                     let label_len = short_label.len() as u16 + 2;
+                    // Color label to match node animation
+                    let label_fg = node_colors.get(&node_idx)
+                        .and_then(|c| *c)
+                        .map(|c| Color::Rgb(c.r, c.g, c.b))
+                        .unwrap_or(Color::Yellow);
                     let span = Span::styled(
                         format!(" {short_label} "),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(label_fg),
                     );
                     frame.render_widget(
                         ratatui::widgets::Paragraph::new(span),
