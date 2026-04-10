@@ -1,42 +1,28 @@
-//! Ollama embedding integration.
+//! Local embedding via fastembed (ONNX inference, no external server needed).
 
-use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
+use fastembed::{EmbeddingModel, TextEmbedding, InitOptions};
+
+/// Default embedding dimension (BGE-small-en-v1.5).
+pub const DIMENSION: usize = 384;
 
 pub struct Embedder {
-    base_url: String,
-    model: String,
-    client: reqwest::blocking::Client,
+    model: Mutex<TextEmbedding>,
     pub dimension: usize,
     max_chars: usize,
 }
 
-#[derive(Serialize)]
-struct EmbedRequest<'a> {
-    model: &'a str,
-    prompt: &'a str,
-}
-
-#[derive(Deserialize)]
-struct EmbedResponse {
-    embedding: Vec<f64>,
-}
-
 impl Embedder {
-    pub fn new(base_url: &str, model: &str) -> Option<Self> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .ok()?;
+    pub fn new() -> Option<Self> {
+        let options = InitOptions::new(EmbeddingModel::BGESmallENV15)
+            .with_show_download_progress(true);
 
-        let dimension = probe_dimension(&client, base_url, model)?;
-        let max_chars = if dimension <= 384 { 1000 } else { 8000 };
+        let model = TextEmbedding::try_new(options).ok()?;
 
         Some(Self {
-            base_url: base_url.to_string(),
-            model: model.to_string(),
-            client,
-            dimension,
-            max_chars,
+            model: Mutex::new(model),
+            dimension: DIMENSION,
+            max_chars: 1000, // BGE-small has ~512 token context
         })
     }
 
@@ -52,45 +38,16 @@ impl Embedder {
             text
         };
 
-        let url = format!("{}/api/embeddings", self.base_url.trim_end_matches('/'));
-        let resp = self
-            .client
-            .post(&url)
-            .json(&EmbedRequest {
-                model: &self.model,
-                prompt: truncated,
-            })
-            .send()
-            .map_err(|e| format!("embed request failed: {e}"))?;
+        let mut model = self.model.lock().map_err(|e| format!("lock: {e}"))?;
+        let results = model
+            .embed(vec![truncated], None)
+            .map_err(|e| format!("embed failed: {e}"))?;
 
-        if !resp.status().is_success() {
-            return Err(format!("Ollama returned status {}", resp.status()));
-        }
-
-        let data: EmbedResponse = resp
-            .json()
-            .map_err(|e| format!("parse embedding response: {e}"))?;
-
-        Ok(data.embedding.into_iter().map(|v| v as f32).collect())
+        results
+            .into_iter()
+            .next()
+            .ok_or_else(|| "empty embedding result".into())
     }
-}
-
-fn probe_dimension(
-    client: &reqwest::blocking::Client,
-    base_url: &str,
-    model: &str,
-) -> Option<usize> {
-    let url = format!("{}/api/embeddings", base_url.trim_end_matches('/'));
-    let resp = client
-        .post(&url)
-        .json(&EmbedRequest {
-            model,
-            prompt: "dimension probe",
-        })
-        .send()
-        .ok()?;
-    let data: EmbedResponse = resp.json().ok()?;
-    Some(data.embedding.len())
 }
 
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -103,9 +60,5 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         norm_b += y * y;
     }
     let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom == 0.0 {
-        0.0
-    } else {
-        dot / denom
-    }
+    if denom == 0.0 { 0.0 } else { dot / denom }
 }

@@ -96,7 +96,7 @@ pub fn run_viz(db_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     terminal.clear()?;
 
     // Open tree and build initial state
-    let tree = birch::Tree::open(db_path, 768, birch::Config::default())
+    let tree = birch::Tree::open(db_path, crate::embed::DIMENSION, birch::Config::default())
         .map_err(|e| format!("open tree: {e}"))?;
     let size = terminal.size()?;
     let state = build_state(&tree, size.width as usize, size.height as usize)?;
@@ -263,7 +263,7 @@ fn build_state(tree: &birch::Tree, width: usize, height: usize) -> Result<VizSta
 /// Poll the DB for changes and update the graph.
 /// Detects: new nodes (coagulate), removed nodes (disperse), changed nodes (pulse).
 fn poll_changes(state: &mut VizState, db_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let tree = birch::Tree::open(db_path, 768, birch::Config::default())
+    let tree = birch::Tree::open(db_path, crate::embed::DIMENSION, birch::Config::default())
         .map_err(|e| format!("reopen tree: {e}"))?;
     let nodes = tree.all_nodes().map_err(|e| format!("all_nodes: {e}"))?;
     let current_ids: std::collections::HashSet<i64> = nodes.iter().map(|n| n.id).collect();

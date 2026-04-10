@@ -82,24 +82,19 @@ fn main() {
     let db_path = data_dir.join("engram.db");
     let db_str = db_path.to_str().expect("invalid path");
 
-    let ollama_url =
-        std::env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://localhost:11434".into());
-    let ollama_model =
-        std::env::var("OLLAMA_EMBED_MODEL").unwrap_or_else(|_| "embeddinggemma".into());
-
     match cli.command {
         Commands::Serve => {
-            let embedder = embed::Embedder::new(&ollama_url, &ollama_model)
-                .expect("Ollama not available — is it running?");
+            let embedder = embed::Embedder::new()
+                .expect("failed to initialize embedding model");
             let tree = birch::Tree::open(db_str, embedder.dimension, birch::Config::default())
                 .expect("cannot open tree");
-            eprintln!("[engram] ready — model={ollama_model} dim={}", embedder.dimension);
+            eprintln!("[engram] ready — dim={}", embedder.dimension);
             mcp::run(tree, embedder).expect("MCP server error");
         }
 
         Commands::Store { content, source } => {
-            let embedder = embed::Embedder::new(&ollama_url, &ollama_model)
-                .expect("Ollama not available");
+            let embedder = embed::Embedder::new()
+                .expect("failed to initialize embedding model");
             let tree = birch::Tree::open(db_str, embedder.dimension, birch::Config::default())
                 .expect("cannot open tree");
             let embedding = embedder.embed(&content).expect("embedding failed");
@@ -108,8 +103,8 @@ fn main() {
         }
 
         Commands::Search { query, limit } => {
-            let embedder = embed::Embedder::new(&ollama_url, &ollama_model)
-                .expect("Ollama not available");
+            let embedder = embed::Embedder::new()
+                .expect("failed to initialize embedding model");
             let tree = birch::Tree::open(db_str, embedder.dimension, birch::Config::default())
                 .expect("cannot open tree");
             let embedding = embedder.embed(&query).expect("embedding failed");
@@ -151,7 +146,7 @@ fn main() {
         }
 
         Commands::Topics => {
-            let tree = birch::Tree::open(db_str, 768, birch::Config::default())
+            let tree = birch::Tree::open(db_str, embed::DIMENSION, birch::Config::default())
                 .expect("cannot open tree");
             let topics = tree.topics().expect("topics failed");
             let total = tree.count().unwrap_or(0);
@@ -160,7 +155,7 @@ fn main() {
         }
 
         Commands::Stats => {
-            let tree = birch::Tree::open(db_str, 768, birch::Config::default())
+            let tree = birch::Tree::open(db_str, embed::DIMENSION, birch::Config::default())
                 .expect("cannot open tree");
             let total = tree.count().unwrap_or(0);
             let topics = tree.topics().unwrap_or_default();
@@ -170,7 +165,7 @@ fn main() {
         }
 
         Commands::Forget { id, source } => {
-            let tree = birch::Tree::open(db_str, 768, birch::Config::default())
+            let tree = birch::Tree::open(db_str, embed::DIMENSION, birch::Config::default())
                 .expect("cannot open tree");
             if let Some(pattern) = source {
                 match tree.forget_by_source(&pattern) {
@@ -189,8 +184,8 @@ fn main() {
         }
 
         Commands::Rebalance => {
-            let embedder = embed::Embedder::new(&ollama_url, &ollama_model)
-                .expect("Ollama not available — is it running?");
+            let embedder = embed::Embedder::new()
+                .expect("failed to initialize embedding model");
             let tree = birch::Tree::open(db_str, embedder.dimension, birch::Config::default())
                 .expect("cannot open tree");
             match tree.rebalance_with_embedder(&embedder) {
@@ -200,16 +195,19 @@ fn main() {
         }
 
         Commands::Rebuild => {
-            let tree = birch::Tree::open(db_str, 768, birch::Config::default())
+            let embedder = embed::Embedder::new()
+                .expect("failed to initialize embedding model");
+            let tree = birch::Tree::open(db_str, embedder.dimension, birch::Config::default())
                 .expect("cannot open tree");
-            match tree.rebuild() {
+            eprintln!("[engram] rebuilding with fastembed (dim={})...", embedder.dimension);
+            match tree.rebuild_with_embedder(&embedder) {
                 Ok(msg) => println!("{msg}"),
                 Err(e) => eprintln!("error: {e}"),
             }
         }
 
         Commands::Tree { width, watch } => {
-            let tree = birch::Tree::open(db_str, 768, birch::Config::default())
+            let tree = birch::Tree::open(db_str, embed::DIMENSION, birch::Config::default())
                 .expect("cannot open tree");
             if let Some(secs) = watch {
                 let duration = std::time::Duration::from_secs_f64(secs);
@@ -230,8 +228,8 @@ fn main() {
         }
 
         Commands::Ingest { dir, limit } => {
-            let embedder = embed::Embedder::new(&ollama_url, &ollama_model)
-                .expect("Ollama not available");
+            let embedder = embed::Embedder::new()
+                .expect("failed to initialize embedding model");
             let tree = birch::Tree::open(db_str, embedder.dimension, birch::Config::default())
                 .expect("cannot open tree");
             ingest(&dir, &tree, &embedder, limit);

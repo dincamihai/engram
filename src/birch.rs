@@ -544,6 +544,71 @@ impl Tree {
         Ok(pruned)
     }
 
+    /// Rebuild the tree from scratch, re-embedding all entries with a new embedder.
+    /// Used for embedding model migration (e.g. Ollama → fastembed).
+    pub fn rebuild_with_embedder(&self, embedder: &crate::embed::Embedder) -> Result<String, String> {
+        // 1. Extract all entries with metadata (preserve timestamps + access counts)
+        let mut stmt = self.conn
+            .prepare("SELECT content, source, created_at, access_count, last_accessed, content_display, compression_level, epoch, temporal_epoch, temporal_shift FROM entries ORDER BY id")
+            .map_err(|e| format!("prepare extract: {e}"))?;
+        let entries: Vec<(String, Option<String>, String, i64, Option<String>, Option<String>, i32, Option<i64>, Option<i64>, Option<i32>)> = stmt
+            .query_map([], |row| Ok((
+                row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                row.get(4)?, row.get(5)?, row.get(6)?,
+                row.get(7)?, row.get(8)?, row.get(9)?,
+            )))
+            .map_err(|e| format!("query entries: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let count = entries.len();
+        if count == 0 {
+            return Ok("nothing to rebuild".into());
+        }
+
+        // 2. Clear everything
+        self.conn
+            .execute_batch("DELETE FROM entries; DELETE FROM nodes;")
+            .map_err(|e| format!("clear tables: {e}"))?;
+
+        // 3. Re-create root
+        self.ensure_root()?;
+
+        // 4. Re-embed, insert into tree, then restore original metadata
+        let mut inserted = 0;
+        let mut errors = 0;
+        for (i, (content, source, created_at, access_count, last_accessed, content_display, compression_level, epoch, temporal_epoch, temporal_shift)) in entries.iter().enumerate() {
+            match embedder.embed(content) {
+                Ok(embedding) => {
+                    match self.store(content, &embedding, source.as_deref()) {
+                        Ok((entry_id, _label)) => {
+                            // Restore original timestamps and metadata
+                            self.conn.execute(
+                                "UPDATE entries SET created_at=?1, access_count=?2, last_accessed=?3, content_display=?4, compression_level=?5, epoch=?6, temporal_epoch=?7, temporal_shift=?8 WHERE id=?9",
+                                rusqlite::params![created_at, access_count, last_accessed, content_display, compression_level, epoch, temporal_epoch, temporal_shift, entry_id],
+                            ).ok();
+                            inserted += 1;
+                        }
+                        Err(e) => {
+                            errors += 1;
+                            log::warn!("skip entry {i}: store error: {e}");
+                        }
+                    }
+                    if inserted % 10 == 0 {
+                        eprint!("\r  re-embedded {inserted}/{count}...");
+                    }
+                }
+                Err(e) => {
+                    errors += 1;
+                    log::warn!("skip entry {i}: embed error: {e}");
+                }
+            }
+        }
+        eprintln!();
+
+        Ok(format!("rebuilt tree: {inserted}/{count} entries re-embedded ({errors} errors)"))
+    }
+
     /// Rebuild the tree from scratch: extract all entries, drop nodes, re-insert.
     pub fn rebuild(&self) -> Result<String, String> {
         // 1. Extract all entries
