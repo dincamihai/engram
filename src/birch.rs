@@ -1393,7 +1393,7 @@ impl Tree {
         }
 
         // Find the most similar pair
-        let merge_threshold = self.config.threshold + 0.15; // merge when clearly same topic
+        let merge_threshold = self.config.threshold + 0.30; // merge only when very clearly same topic
         let mut best_sim = f32::NEG_INFINITY;
         let mut merge_a = 0i64;
         let mut merge_b = 0i64;
