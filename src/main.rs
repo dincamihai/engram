@@ -71,6 +71,12 @@ enum Commands {
     Extract {
         /// Text to process (or - for stdin)
         text: String,
+        /// Automatically store if relevant
+        #[arg(long)]
+        store: bool,
+        /// Source label for stored memory
+        #[arg(long)]
+        source: Option<String>,
     },
 }
 
@@ -240,7 +246,7 @@ fn main() {
             ingest(&dir, &tree, &embedder, limit);
         }
 
-        Commands::Extract { text } => {
+        Commands::Extract { text, store: do_store, source } => {
             let input = if text == "-" {
                 let mut buf = String::new();
                 std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).expect("read stdin");
@@ -253,12 +259,23 @@ fn main() {
             let pipeline = engram::extract::Pipeline::new()
                 .expect("failed to init pipeline");
 
-            let (score, hyp) = pipeline.classifier.is_relevant(&input)
-                .expect("classify failed");
-            eprintln!("  relevance: {score:.3} ({hyp})");
-
             match pipeline.process(&input).expect("extraction failed") {
-                Some((summary, score)) => println!("[relevant {score:.2}] {summary}"),
+                Some((summary, score)) => {
+                    eprintln!("[relevant {score:.2}] {}", &summary[..summary.len().min(80)]);
+                    if do_store {
+                        let embedding = pipeline.embedder.embed(&summary)
+                            .expect("embed failed");
+                        let tree = birch::Tree::open(db_str, pipeline.embedder.dimension, birch::Config::default())
+                            .expect("cannot open tree");
+                        let src = source.as_deref().unwrap_or("auto-extract");
+                        match tree.store(&summary, &embedding, Some(src)) {
+                            Ok((_id, label)) => eprintln!("[stored] → {label}"),
+                            Err(e) => eprintln!("[error] {e}"),
+                        }
+                    } else {
+                        println!("{summary}");
+                    }
+                }
                 None => eprintln!("[engram] not relevant enough to store"),
             }
         }
