@@ -1,3 +1,4 @@
 /target
 *.db
 /.cache/
+.fastembed_cache/
