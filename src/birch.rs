@@ -1301,6 +1301,9 @@ impl Tree {
         Ok(ids)
     }
 
+    /// Find small leaf nodes that are mature enough to merge.
+    /// Only merges clusters where the newest entry is older than 7 days —
+    /// fresh small clusters are emergent topics that should be given time to grow.
     fn find_small_leaves(&self, min_entries: i64) -> Result<Vec<i64>, String> {
         let mut stmt = self
             .conn
@@ -1309,7 +1312,11 @@ impl Tree {
                  WHERE n.parent_id IS NOT NULL
                  AND NOT EXISTS (SELECT 1 FROM nodes c WHERE c.parent_id = n.id)
                  AND (SELECT COUNT(*) FROM entries e WHERE e.node_id = n.id) < ?1
-                 AND (SELECT COUNT(*) FROM entries e WHERE e.node_id = n.id) > 0",
+                 AND (SELECT COUNT(*) FROM entries e WHERE e.node_id = n.id) > 0
+                 AND NOT EXISTS (
+                     SELECT 1 FROM entries e WHERE e.node_id = n.id
+                     AND e.created_at > datetime('now', '-7 days')
+                 )",
             )
             .map_err(|e| format!("prepare small: {e}"))?;
 
