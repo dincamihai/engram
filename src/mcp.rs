@@ -140,10 +140,10 @@ fn queue_watcher(
         // Process each item
         for (_id, text, source) in &items {
             let sentences = crate::extract::split_sentences(text);
-            let summary = if sentences.len() <= 3 {
+            let summary = if sentences.len() <= 5 {
                 sentences.join(" ")
             } else {
-                crate::extract::extractive_summary(&sentences, embedder, 2).join(" ")
+                crate::extract::extractive_summary(&sentences, embedder, 3).join(" ")
             };
 
             if summary.is_empty() { continue; }

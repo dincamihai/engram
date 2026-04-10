@@ -9,11 +9,14 @@ use ort::value::Value;
 /// Binary relevance hypotheses — BERT decides "worth remembering?" not "what category?"
 /// BIRCH handles categorization through embedding clustering.
 pub const RELEVANCE_HYPOTHESES: &[&str] = &[
-    "This contains useful technical information.",
+    "This is about a bug or failure.",
     "This describes a person or team.",
     "This is about a customer or problem.",
-    "This describes software or infrastructure.",
+    "This describes a system or service.",
     "This is about a work process or decision.",
+    "This describes a deployment or configuration.",
+    "This is about a policy or security requirement.",
+    "This mentions a number or quantity.",
 ];
 
 /// Relevance threshold — NLI entailment score above this means "worth storing".
@@ -199,11 +202,11 @@ impl Pipeline {
             return Ok(None);
         }
 
-        // Extract or use directly
-        let summary = if sentences.len() <= 3 {
+        // Extract or use directly — only summarize truly long content
+        let summary = if sentences.len() <= 5 {
             sentences.join(" ")
         } else {
-            extractive_summary(&sentences, &self.embedder, 2).join(" ")
+            extractive_summary(&sentences, &self.embedder, 3).join(" ")
         };
 
         // Binary relevance check
