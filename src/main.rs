@@ -67,6 +67,11 @@ enum Commands {
     },
     /// X-ray live: animated BIRCH tree visualization
     Viz,
+    /// Extract + classify text using BERT NLI pipeline
+    Extract {
+        /// Text to process (or - for stdin)
+        text: String,
+    },
 }
 
 fn main() {
@@ -233,6 +238,29 @@ fn main() {
             let tree = birch::Tree::open(db_str, embedder.dimension, birch::Config::default())
                 .expect("cannot open tree");
             ingest(&dir, &tree, &embedder, limit);
+        }
+
+        Commands::Extract { text } => {
+            let input = if text == "-" {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).expect("read stdin");
+                buf
+            } else {
+                text
+            };
+
+            eprintln!("[engram] initializing extraction pipeline...");
+            let pipeline = engram::extract::Pipeline::new()
+                .expect("failed to init pipeline");
+
+            let (score, hyp) = pipeline.classifier.is_relevant(&input)
+                .expect("classify failed");
+            eprintln!("  relevance: {score:.3} ({hyp})");
+
+            match pipeline.process(&input).expect("extraction failed") {
+                Some((summary, score)) => println!("[relevant {score:.2}] {summary}"),
+                None => eprintln!("[engram] not relevant enough to store"),
+            }
         }
     }
 }
