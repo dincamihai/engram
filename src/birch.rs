@@ -20,8 +20,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            threshold: 0.65,
-            leaf_capacity: 50,
+            threshold: 0.50,
+            leaf_capacity: 15,
             branch_factor: 10,
         }
     }
@@ -1255,6 +1255,16 @@ impl Tree {
         self.conn
             .execute("DELETE FROM nodes WHERE id = ?1", params![node_id])
             .map_err(|e| format!("delete old leaf: {e}"))?;
+
+        // Recursively split children that still exceed capacity
+        let count_a = self.node_entry_count(leaf_a)?;
+        if count_a > self.config.leaf_capacity as i64 {
+            self.split_leaf(leaf_a)?;
+        }
+        let count_b = self.node_entry_count(leaf_b)?;
+        if count_b > self.config.leaf_capacity as i64 {
+            self.split_leaf(leaf_b)?;
+        }
 
         Ok(())
     }
