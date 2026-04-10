@@ -130,6 +130,12 @@ impl Tree {
                 temporal_epoch INTEGER,
                 temporal_shift INTEGER DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT NOT NULL,
+                source TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE INDEX IF NOT EXISTS idx_entries_node ON entries(node_id);
             CREATE INDEX IF NOT EXISTS idx_nodes_parent ON nodes(parent_id);",
         )
@@ -156,6 +162,35 @@ impl Tree {
     /// Return the database file path.
     pub fn db_path(&self) -> &str {
         &self.path
+    }
+
+    /// Add an item to the processing queue.
+    pub fn queue_push(&self, text: &str, source: Option<&str>) -> Result<i64, String> {
+        self.conn
+            .execute(
+                "INSERT INTO queue (text, source) VALUES (?1, ?2)",
+                params![text, source],
+            )
+            .map_err(|e| format!("queue push: {e}"))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Drain all items from the queue, returning (id, text, source).
+    pub fn queue_drain(&self) -> Result<Vec<(i64, String, Option<String>)>, String> {
+        let mut stmt = self.conn
+            .prepare("SELECT id, text, source FROM queue ORDER BY id")
+            .map_err(|e| format!("queue drain: {e}"))?;
+        let items: Vec<(i64, String, Option<String>)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(|e| format!("queue query: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+        if !items.is_empty() {
+            self.conn
+                .execute("DELETE FROM queue", [])
+                .map_err(|e| format!("queue clear: {e}"))?;
+        }
+        Ok(items)
     }
 
     fn ensure_root(&self) -> Result<(), String> {

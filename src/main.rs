@@ -67,6 +67,14 @@ enum Commands {
     },
     /// X-ray live: animated BIRCH tree visualization
     Viz,
+    /// Add text to processing queue (instant, processed by serve)
+    Queue {
+        /// Text to queue
+        text: String,
+        /// Source label
+        #[arg(long)]
+        source: Option<String>,
+    },
     /// Extract + classify text using BERT NLI pipeline
     Extract {
         /// Text to process (or - for stdin)
@@ -244,6 +252,16 @@ fn main() {
             let tree = birch::Tree::open(db_str, embedder.dimension, birch::Config::default())
                 .expect("cannot open tree");
             ingest(&dir, &tree, &embedder, limit);
+        }
+
+        Commands::Queue { text, source } => {
+            let tree = birch::Tree::open(db_str, embed::DIMENSION, birch::Config::default())
+                .expect("cannot open tree");
+            let src = source.as_deref();
+            match tree.queue_push(&text, src) {
+                Ok(id) => eprintln!("[engram] queued #{id}"),
+                Err(e) => eprintln!("[engram] queue error: {e}"),
+            }
         }
 
         Commands::Extract { text, store: do_store, source } => {
