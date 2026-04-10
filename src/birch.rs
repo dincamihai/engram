@@ -1488,7 +1488,7 @@ impl Tree {
         })
     }
 
-    fn node_entries(&self, node_id: i64, content_limit: usize) -> Result<Vec<TopicEntry>, String> {
+    pub fn node_entries(&self, node_id: i64, content_limit: usize) -> Result<Vec<TopicEntry>, String> {
         let mut stmt = self
             .conn
             .prepare(
@@ -1569,6 +1569,32 @@ impl Tree {
                 |row| row.get(0),
             )
             .map_err(|e| format!("node_total_access: {e}"))
+    }
+
+    /// Returns the age in hours of the most recent entry in a node.
+    /// 0.0 = just created, larger = older. Returns None if no entries.
+    pub fn node_freshness_hours(&self, node_id: i64) -> Result<Option<f64>, String> {
+        let result: Option<String> = self.conn
+            .query_row(
+                "SELECT MAX(COALESCE(last_accessed, created_at)) FROM entries WHERE node_id = ?1",
+                rusqlite::params![node_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("node_freshness: {e}"))?;
+
+        match result {
+            Some(ts) => {
+                let now = chrono::Utc::now();
+                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&ts) {
+                    let dt_utc = dt.with_timezone(&chrono::Utc);
+                    let hours = (now - dt_utc).num_minutes() as f64 / 60.0;
+                    Ok(Some(hours.max(0.0)))
+                } else {
+                    Ok(None)
+                }
+            }
+            None => Ok(None),
+        }
     }
 }
 
