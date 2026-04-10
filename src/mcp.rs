@@ -202,44 +202,18 @@ fn handle(req: &Request, tree: &Tree, embedder: &Embedder, aha: Option<&AhaDetec
     }
 }
 
-fn dispatch(name: &str, args: &serde_json::Value, tree: &Tree, embedder: &Embedder, aha: Option<&AhaDetector>) -> String {
+fn dispatch(name: &str, args: &serde_json::Value, tree: &Tree, embedder: &Embedder, _aha: Option<&AhaDetector>) -> String {
     let result = match name {
-        "engram_store" => {
+        "engram_queue" => {
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
             let source = args.get("source").and_then(|v| v.as_str());
 
             if content.is_empty() {
                 json!({"error": "content is required"})
             } else {
-                let dated = format!("{}: {}", chrono::Utc::now().format("%Y-%m-%d"), content);
-                match embedder.embed(&dated) {
-                    Ok(embedding) => {
-                        // Check for aha moment against raw content (undated)
-                        let aha_triggered = if let Some(detector) = aha {
-                            let raw_emb = embedder.embed(content).ok();
-                            let check_emb = raw_emb.as_deref().unwrap_or(&embedding);
-                            if let Some(sim) = detector.check(check_emb) {
-                                let activated = tree.replay(&embedding, 0.2, 5).unwrap_or(0);
-                                Some((sim, activated))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-
-                        match tree.store(&dated, &embedding, source) {
-                            Ok((_id, _topic)) => {
-                                // Silently trigger spreading activation on aha moments
-                                if let Some((_sim, _activated)) = aha_triggered {
-                                    // activation already happened above
-                                }
-                                json!({"stored": true})
-                            }
-                            Err(e) => json!({"error": e}),
-                        }
-                    }
-                    Err(e) => json!({"error": format!("embedding failed: {e}")}),
+                match tree.queue_push(content, source) {
+                    Ok(_id) => json!({"queued": true}),
+                    Err(e) => json!({"error": e}),
                 }
             }
         }
@@ -270,13 +244,13 @@ fn dispatch(name: &str, args: &serde_json::Value, tree: &Tree, embedder: &Embedd
 fn tools() -> Vec<serde_json::Value> {
     vec![
         json!({
-            "name": "engram_store",
-            "description": "Store a memory. Content is embedded and self-organized into topics.",
+            "name": "engram_queue",
+            "description": "Queue content for memory processing. Classified by BERT NLI — only relevant content is stored.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "content": {"type": "string", "description": "The memory content to store"},
-                    "source": {"type": "string", "description": "Optional source reference"}
+                    "content": {"type": "string", "description": "The content to process and potentially store as memory"},
+                    "source": {"type": "string", "description": "Optional source label (e.g. confluence, vault, conversation)"}
                 },
                 "required": ["content"]
             }

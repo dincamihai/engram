@@ -588,7 +588,7 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
 
     // Render: one row per cluster — label on left, blocks extending right
     let label_width = 14_usize; // fixed label column width
-    let block_cols = w.saturating_sub(label_width + 1); // remaining space for blocks
+    let _block_cols = w.saturating_sub(label_width + 1); // remaining space for blocks
 
     // Group blocks by cluster
     let mut cluster_blocks: Vec<(String, Vec<&Block>)> = Vec::new();
