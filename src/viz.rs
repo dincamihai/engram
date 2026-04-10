@@ -400,43 +400,53 @@ fn run_loop(
 
         // Handle events
         if event::poll(Duration::from_millis(33))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+            match event::read()? {
+                Event::Resize(_, _) => {
+                    // Let ratatui recalculate its area; grid resize handled below
+                    let _ = terminal.size();
                 }
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Char('r') => {
-                        let config = state.physics.config.clone();
-                        state.physics = PhysicsEngine::new(&state.graph, config);
-                        state.physics.normalize_positions();
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
                     }
-                    KeyCode::Char('+') | KeyCode::Char('=') => {
-                        state.zoom *= 1.2;
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                        KeyCode::Char('r') => {
+                            let config = state.physics.config.clone();
+                            state.physics = PhysicsEngine::new(&state.graph, config);
+                            state.physics.normalize_positions();
+                        }
+                        KeyCode::Char('+') | KeyCode::Char('=') => {
+                            state.zoom *= 1.2;
+                        }
+                        KeyCode::Char('-') => {
+                            state.zoom /= 1.2;
+                        }
+                        KeyCode::Up => state.pan_y -= 10.0,
+                        KeyCode::Down => state.pan_y += 10.0,
+                        KeyCode::Left => state.pan_x -= 10.0,
+                        KeyCode::Right => state.pan_x += 10.0,
+                        KeyCode::Char('l') => state.show_labels = !state.show_labels,
+                        KeyCode::Char(' ') => state.paused = !state.paused,
+                        _ => {}
                     }
-                    KeyCode::Char('-') => {
-                        state.zoom /= 1.2;
-                    }
-                    KeyCode::Up => state.pan_y -= 10.0,
-                    KeyCode::Down => state.pan_y += 10.0,
-                    KeyCode::Left => state.pan_x -= 10.0,
-                    KeyCode::Right => state.pan_x += 10.0,
-                    KeyCode::Char('l') => state.show_labels = !state.show_labels,
-                    KeyCode::Char(' ') => state.paused = !state.paused,
-                    _ => {}
                 }
+                _ => {}
             }
         }
 
         // Resize grid if terminal size changed
-        let size = terminal.size()?;
+        let size = terminal.size().unwrap_or(ratatui::layout::Size::new(state.grid_w as u16, state.grid_h as u16));
         let new_w = size.width as usize;
         let new_h = size.height as usize;
         if new_w != state.grid_w || new_h != state.grid_h {
-            if new_w > 2 && new_h > 2 {
-                let mut new_grid = BrailleGrid::new(new_w, new_h)?;
-                new_grid.enable_color_support();
-                state.grid = new_grid;
+            if new_w > 4 && new_h > 4 {
+                if let Ok(mut new_grid) = BrailleGrid::new(new_w, new_h) {
+                    new_grid.enable_color_support();
+                    state.grid = new_grid;
+                    state.grid_w = new_w;
+                    state.grid_h = new_h;
+                }
             }
         }
     }
