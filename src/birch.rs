@@ -1571,6 +1571,17 @@ impl Tree {
             .map_err(|e| format!("node_total_access: {e}"))
     }
 
+    /// Returns the number of never-accessed entries in a node.
+    pub fn node_unproven_count(&self, node_id: i64) -> Result<i64, String> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE node_id = ?1 AND access_count = 0 AND source != 'consolidated'",
+                rusqlite::params![node_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("node_unproven_count: {e}"))
+    }
+
     /// Returns the number of consolidated entries in a node.
     pub fn node_consolidated_count(&self, node_id: i64) -> Result<i64, String> {
         self.conn

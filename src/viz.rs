@@ -37,6 +37,8 @@ struct VizNode {
     freshness: f32,
     /// Number of consolidated (merged) entries in this node.
     consolidated: i64,
+    /// Number of never-accessed entries (unproven knowledge).
+    unproven: i64,
 }
 
 /// Animation state for a node.
@@ -127,6 +129,7 @@ fn build_state(tree: &birch::Tree, width: usize, height: usize) -> Result<VizSta
         let freshness = (1.0 / (1.0 + age_hours / 72.0)) as f32; // half-life = 3 days
 
         let consolidated = tree.node_consolidated_count(node.id).unwrap_or(0);
+        let unproven = tree.node_unproven_count(node.id).unwrap_or(0);
         let viz_node = VizNode {
             id: node.id,
             label: node.label.clone(),
@@ -135,6 +138,7 @@ fn build_state(tree: &birch::Tree, width: usize, height: usize) -> Result<VizSta
             access,
             freshness,
             consolidated,
+            unproven,
         };
         let idx = graph.add_node(viz_node);
         node_map.push((node.id, idx));
@@ -260,6 +264,7 @@ fn poll_changes(state: &mut VizState, db_path: &str) -> Result<(), Box<dyn std::
                 .unwrap_or(0.0);
             let freshness = (1.0 / (1.0 + age_hours / 72.0)) as f32;
             let consolidated = tree.node_consolidated_count(node.id).unwrap_or(0);
+            let unproven = tree.node_unproven_count(node.id).unwrap_or(0);
             let viz_node = VizNode {
                 id: node.id,
                 label: node.label.clone(),
@@ -268,6 +273,7 @@ fn poll_changes(state: &mut VizState, db_path: &str) -> Result<(), Box<dyn std::
                 access,
                 freshness,
                 consolidated,
+                unproven,
             };
             let idx = state.graph.add_node(viz_node);
             // Add edge to parent if parent exists in graph
@@ -748,11 +754,14 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
         // Draw orbiting data point satellites around leaf nodes
         // Fresh memories orbit actively; old memories slow down and become static
         // Consolidated memories appear as clumps (2-3 dots stuck together)
+        // Unproven (never-accessed) memories orbit further out — loosely held
         if is_leaf && node.count > 0 {
-            let normal_count = (node.count - node.consolidated).max(0) as usize;
+            let proven_count = (node.count - node.consolidated - node.unproven).max(0) as usize;
+            let unproven_count = node.unproven.min(24) as usize;
             let consol_count = node.consolidated.min(24) as usize;
-            let total_points = (normal_count + consol_count).min(24);
-            let orbit_radius = (dot_size as f64) + 3.0 + (node.count as f64).sqrt() * 1.5;
+            let total_points = (proven_count + unproven_count + consol_count).min(24);
+            let inner_radius = (dot_size as f64) + 3.0 + (node.count as f64).sqrt() * 1.2;
+            let outer_radius = inner_radius * 1.8; // unproven orbit 80% further out
 
             // Orbit speed scales with freshness: fresh = lively, old = nearly frozen
             let orbit_speed = 0.002 + 0.02 * node.freshness as f64; // 0.002 (static) → 0.022 (fast)
@@ -761,12 +770,18 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
             let wobble_amp = 0.02 + 0.15 * node.freshness as f64;
 
             for i in 0..total_points {
-                let is_consolidated = i >= normal_count;
+                // Classify: proven first, then unproven, then consolidated
+                let is_unproven = i >= proven_count && i < proven_count + unproven_count;
+                let is_consolidated = i >= proven_count + unproven_count;
+
                 let base_angle = (i as f64 / total_points as f64) * std::f64::consts::TAU;
                 let speed = 1.0 + (i as f64 * 0.1);
                 let angle = base_angle + orbit_base * speed;
                 let wobble = 1.0 + wobble_amp * ((orbit_base * 2.0 + i as f64 * 1.3).sin());
-                let r = orbit_radius * wobble;
+
+                // Proven = inner orbit, unproven = outer orbit, consolidated = inner
+                let base_r = if is_unproven { outer_radius } else { inner_radius };
+                let r = base_r * wobble;
 
                 let cx = ux as f64 + (dot_size as f64 / 2.0) + r * angle.cos();
                 let cy = uy as f64 + (dot_size as f64 / 2.0) + r * angle.sin();
