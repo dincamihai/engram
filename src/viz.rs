@@ -49,8 +49,8 @@ enum NodeAnim {
     Stable,
 }
 
-const ANIM_SPEED: f32 = 0.008; // progress per frame (~4s at 30fps for full cycle)
-const VIBRATE_AMPLITUDE: f64 = 3.0; // pixels of shake
+const ANIM_SPEED: f32 = 0.005; // progress per frame (~6.7s at 30fps for full cycle) — slower for visibility
+const VIBRATE_AMPLITUDE: f64 = 5.0; // pixels of shake — increased for prominence
 
 /// State for the visualization.
 struct VizState {
@@ -502,21 +502,23 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
             let anim = state.animations.get(&idx).unwrap_or(&NodeAnim::Stable);
             let color = match anim {
                 NodeAnim::Growing { progress } => {
-                    // Bright green fading to default as progress → 1
+                    // Vivid lime green → normal, pulsing bright
                     let t = *progress;
+                    let pulse = 0.5 + 0.5 * ((t * std::f32::consts::PI * 2.0).sin()); // oscillate 0.0-1.0
                     Some(DotColor::rgb(
-                        (30.0 + 170.0 * t) as u8,   // R: 30 → 200
-                        (255.0 - 55.0 * t) as u8,    // G: 255 → 200
-                        (50.0 + 150.0 * t) as u8,    // B: 50 → 200
+                        (50.0 + 120.0 * (1.0 - t) * pulse) as u8,  // R: 50 → 170 (pulsing)
+                        (255.0 - 30.0 * t) as u8,                  // G: 255 → 225
+                        (30.0 + 100.0 * t) as u8,                  // B: 30 → 130
                     ))
                 }
                 NodeAnim::Shrinking { progress } => {
-                    // Bright red fading to dim as progress → 1
+                    // Vivid red → dark, pulsing bright
                     let t = *progress;
+                    let pulse = 0.5 + 0.5 * ((t * std::f32::consts::PI * 2.0).sin()); // oscillate 0.0-1.0
                     Some(DotColor::rgb(
-                        (255.0 * (1.0 - t * 0.7)) as u8, // R: 255 → 76
-                        (40.0 * (1.0 - t)) as u8,         // G: 40 → 0
-                        (20.0 * (1.0 - t)) as u8,          // B: 20 → 0
+                        (255.0 * (1.0 - t * 0.5) * pulse) as u8,  // R: 255 → 127 (pulsing)
+                        (30.0 * (1.0 - t)) as u8,                 // G: 30 → 0
+                        (10.0 * (1.0 - t)) as u8,                 // B: 10 → 0
                     ))
                 }
                 NodeAnim::Vibrating { progress } => {
@@ -587,8 +589,8 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
         let node_color = node_colors.get(&node_idx).and_then(|c| *c);
         // Animated nodes get a size pulse for extra visibility
         let anim_boost = match anim {
-            NodeAnim::Growing { progress } => ((1.0 - *progress) * 2.0) as usize,
-            NodeAnim::Shrinking { progress } => ((1.0 - *progress) * 1.5) as usize,
+            NodeAnim::Growing { progress } => ((1.0 - *progress) * 4.0) as usize,  // bigger pulse on add
+            NodeAnim::Shrinking { progress } => ((1.0 - *progress) * 3.0) as usize, // bigger pulse on delete
             _ => 0,
         };
         let dot_size = if node.depth == 0 { 3 + anim_boost } else { 1 + anim_boost };
@@ -609,8 +611,9 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
             }
         }
 
-        // Extra dots for big clusters
-        if node.count > 5 && dot_size <= 1 {
+        // Extra dots for big clusters — also show during animations for more prominence
+        let is_animating = !matches!(anim, NodeAnim::Stable);
+        if (node.count > 5 && dot_size <= 1) || (is_animating && node.count > 2) {
             if ux + 1 < state.grid_w * 2 {
                 state.grid.set_dot(ux + 1, uy).ok();
                 if let Some(color) = node_color {
