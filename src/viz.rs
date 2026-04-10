@@ -639,9 +639,10 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
                 freshness_rgb(b.freshness)
             };
 
-            // Flicker for fresh blocks
-            let jitter = (state.frame as f64 * 0.08 + b.seed).sin();
-            let flicker = if b.freshness > 0.5 && jitter > 0.7 { 1.15 } else { 1.0 };
+            // Flicker only for new unproven entries — speed decays with age
+            let flicker_speed = 0.02 + 0.12 * b.freshness as f64; // fresh(1.0)=0.14 fast, aging(0.8)=0.12 slower
+            let jitter = (state.frame as f64 * flicker_speed + b.seed).sin();
+            let flicker = if b.is_unproven && b.freshness > 0.8 && jitter > 0.7 { 1.3 } else { 1.0 };
             let r = (r as f64 * flicker).min(255.0) as u8;
             let g = (g as f64 * flicker).min(255.0) as u8;
             let bl = (bl as f64 * flicker).min(255.0) as u8;
