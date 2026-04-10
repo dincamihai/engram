@@ -123,11 +123,12 @@ fn build_state(tree: &birch::Tree, width: usize, height: usize) -> Result<VizSta
     let mut node_map: Vec<(i64, petgraph::graph::NodeIndex)> = Vec::new();
 
     // PCA-like 2D projection of centroids:
-    // 1. Compute mean centroid
-    let dim = nodes[0].centroid.len();
-    let n = nodes.len() as f64;
+    // 1. Compute mean centroid (only nodes with correct dimension)
+    let dim = crate::embed::DIMENSION;
+    let valid_nodes: Vec<&_> = nodes.iter().filter(|n| n.centroid.len() == dim).collect();
+    let n = valid_nodes.len().max(1) as f64;
     let mut mean = vec![0.0f64; dim];
-    for node in &nodes {
+    for node in &valid_nodes {
         for (i, v) in node.centroid.iter().enumerate() {
             mean[i] += *v as f64 / n;
         }
@@ -135,7 +136,7 @@ fn build_state(tree: &birch::Tree, width: usize, height: usize) -> Result<VizSta
 
     // 2. Find the two dimensions with highest variance
     let mut variance = vec![0.0f64; dim];
-    for node in &nodes {
+    for node in &valid_nodes {
         for (i, v) in node.centroid.iter().enumerate() {
             let d = *v as f64 - mean[i];
             variance[i] += d * d / n;
@@ -150,8 +151,8 @@ fn build_state(tree: &birch::Tree, width: usize, height: usize) -> Result<VizSta
     //    Center = fresh/active, edge = aging/fading
     let projections: Vec<(f64, f64)> = nodes.iter()
         .map(|node| {
-            let px = node.centroid[dim_x] as f64 - mean[dim_x];
-            let py = node.centroid[dim_y] as f64 - mean[dim_y];
+            let px = if dim_x < node.centroid.len() { node.centroid[dim_x] as f64 - mean[dim_x] } else { 0.0 };
+            let py = if dim_y < node.centroid.len() { node.centroid[dim_y] as f64 - mean[dim_y] } else { 0.0 };
             // Angle = semantic direction (preserved from PCA)
             let angle = py.atan2(px);
             // Freshness for radius: compute here (same formula as VizNode)
