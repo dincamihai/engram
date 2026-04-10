@@ -146,12 +146,23 @@ fn build_state(tree: &birch::Tree, width: usize, height: usize) -> Result<VizSta
     let dim_x = dim_indices[0];
     let dim_y = if dim_indices.len() > 1 { dim_indices[1] } else { 0 };
 
-    // 3. Project each node to 2D using top-2 variance dimensions
+    // 3. Project to polar: angle from PCA (semantic direction), radius from freshness
+    //    Center = fresh/active, edge = aging/fading
     let projections: Vec<(f64, f64)> = nodes.iter()
         .map(|node| {
-            let x = node.centroid[dim_x] as f64 - mean[dim_x];
-            let y = node.centroid[dim_y] as f64 - mean[dim_y];
-            (x, y)
+            let px = node.centroid[dim_x] as f64 - mean[dim_x];
+            let py = node.centroid[dim_y] as f64 - mean[dim_y];
+            // Angle = semantic direction (preserved from PCA)
+            let angle = py.atan2(px);
+            // Freshness for radius: compute here (same formula as VizNode)
+            let age_hours = tree.node_freshness_hours(node.id)
+                .unwrap_or(None)
+                .unwrap_or(720.0);
+            let freshness = 1.0 / (1.0 + age_hours / 72.0);
+            // Radius: fresh = outer edge (new arrival), old+proven = center (core knowledge)
+            // Fresh memories start at the periphery and migrate inward as they get accessed
+            let radius = 0.2 + 0.8 * freshness; // fresh(1.0) = outer(1.0), old(0.0) = core(0.2)
+            (angle.cos() * radius, angle.sin() * radius)
         })
         .collect();
 
@@ -514,8 +525,159 @@ fn run_loop(
 
 fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
     let area = frame.area();
-    state.grid.clear();
-    state.grid.clear_colors();
+    let w = area.width as usize;
+    let h = area.height.saturating_sub(1) as usize; // leave 1 row for HUD
+
+    // Collect all entries as blocks from leaf nodes, grouped by cluster
+    struct Block { freshness: f32, is_unproven: bool, is_consolidated: bool, anim_color: Option<(u8, u8, u8)>, seed: f64 }
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut cluster_boundaries: Vec<usize> = Vec::new(); // index where each cluster starts
+    let mut total_entries: usize = 0;
+
+    let leaf_nodes: std::collections::HashSet<NodeIndex> = state.graph.node_indices()
+        .filter(|&idx| state.graph.neighbors_directed(idx, petgraph::Direction::Outgoing).next().is_none())
+        .collect();
+
+    let mut leaf_list: Vec<NodeIndex> = leaf_nodes.iter().copied().collect();
+    leaf_list.sort_by_key(|&idx| (state.graph[idx].depth, state.graph[idx].id));
+
+    for &node_idx in &leaf_list {
+        let node = &state.graph[node_idx];
+        if node.count <= 0 { continue; }
+        let proven = (node.count - node.consolidated - node.unproven).max(0) as usize;
+        let unproven = node.unproven as usize;
+        let consol = node.consolidated as usize;
+
+        let anim_color = match state.animations.get(&node_idx) {
+            Some(NodeAnim::Growing { progress }) => {
+                let p = 0.5 + 0.5 * ((progress * std::f32::consts::PI * 3.0).sin());
+                Some(((80.0 * p) as u8, (255.0 * p.max(0.5)) as u8, (60.0 * p) as u8))
+            }
+            Some(NodeAnim::Shrinking { progress }) => {
+                let p = 0.5 + 0.5 * ((progress * std::f32::consts::PI * 3.0).sin());
+                Some(((255.0 * p) as u8, (40.0 * (1.0 - progress)) as u8, (30.0 * (1.0 - progress)) as u8))
+            }
+            _ => None,
+        };
+
+        cluster_boundaries.push(blocks.len());
+        for i in 0..proven {
+            blocks.push(Block { freshness: node.freshness, is_unproven: false, is_consolidated: false, anim_color, seed: i as f64 * 7.3 + node.id as f64 * 3.1 });
+        }
+        for i in 0..unproven {
+            blocks.push(Block { freshness: node.freshness, is_unproven: true, is_consolidated: false, anim_color, seed: (proven + i) as f64 * 7.3 + node.id as f64 * 3.1 });
+        }
+        for i in 0..consol {
+            blocks.push(Block { freshness: node.freshness, is_unproven: false, is_consolidated: true, anim_color, seed: (proven + unproven + i) as f64 * 7.3 + node.id as f64 * 3.1 });
+        }
+        total_entries += proven + unproven + consol;
+    }
+    // Add a gap block between clusters
+    let cluster_starts: std::collections::HashSet<usize> = cluster_boundaries.into_iter().collect();
+
+    // Freshness to RGB
+    let freshness_rgb = |f: f32| -> (u8, u8, u8) {
+        let f = f.clamp(0.0, 1.0);
+        (
+            (100.0 + 155.0 * f) as u8,
+            (160.0 + 70.0 * f * f) as u8,
+            (220.0 - 80.0 * f) as u8,
+        )
+    };
+
+    // Render: one row per cluster — label on left, blocks extending right
+    let label_width = 14_usize; // fixed label column width
+    let block_cols = w.saturating_sub(label_width + 1); // remaining space for blocks
+
+    // Group blocks by cluster
+    let mut cluster_blocks: Vec<(String, Vec<&Block>)> = Vec::new();
+    let mut bi = 0;
+    for &node_idx in &leaf_list {
+        let node = &state.graph[node_idx];
+        if node.count <= 0 { continue; }
+        let count = (node.count) as usize;
+        let label = if node.label.len() > label_width - 1 {
+            format!("{}..", &node.label[..label_width - 3])
+        } else {
+            node.label.clone()
+        };
+        let cluster: Vec<&Block> = blocks[bi..bi + count.min(blocks.len() - bi)].iter().collect();
+        bi += cluster.len();
+        cluster_blocks.push((label, cluster));
+    }
+
+    let mut lines: Vec<ratatui::text::Line> = Vec::with_capacity(h);
+
+    for (label, cluster) in &cluster_blocks {
+        if lines.len() >= h { break; }
+
+        let mut spans: Vec<Span> = Vec::with_capacity(w);
+
+        // Label with freshness color of first block
+        let label_color = if let Some(b) = cluster.first() {
+            let (r, g, bl) = freshness_rgb(b.freshness);
+            Color::Rgb(r, g, bl)
+        } else {
+            Color::DarkGray
+        };
+        let padded_label = format!("{:>width$} ", label, width = label_width - 1);
+        spans.push(Span::styled(padded_label, Style::default().fg(label_color)));
+
+        // Blocks
+        for (_i, b) in cluster.iter().enumerate() {
+            if spans.len() >= w { break; }
+
+            let (r, g, bl) = if let Some((ar, ag, ab)) = b.anim_color {
+                (ar, ag, ab)
+            } else if b.is_consolidated {
+                let (r, g, bl) = freshness_rgb(b.freshness);
+                ((r as f64 * 0.5) as u8, (g as f64 * 0.5) as u8, (bl as f64 * 0.7) as u8)
+            } else if b.is_unproven {
+                let (r, g, bl) = freshness_rgb(b.freshness);
+                ((r as f64 * 0.4) as u8, (g as f64 * 0.4) as u8, (bl as f64 * 0.4) as u8)
+            } else {
+                freshness_rgb(b.freshness)
+            };
+
+            // Flicker for fresh blocks
+            let jitter = (state.frame as f64 * 0.08 + b.seed).sin();
+            let flicker = if b.freshness > 0.5 && jitter > 0.7 { 1.15 } else { 1.0 };
+            let r = (r as f64 * flicker).min(255.0) as u8;
+            let g = (g as f64 * flicker).min(255.0) as u8;
+            let bl = (bl as f64 * flicker).min(255.0) as u8;
+
+            spans.push(Span::styled("█", Style::default().fg(Color::Rgb(r, g, bl))));
+        }
+
+        // Fill remaining with spaces
+        while spans.len() < w {
+            spans.push(Span::raw(" "));
+        }
+
+        lines.push(ratatui::text::Line::from(spans));
+    }
+
+    // Fill remaining rows
+    while lines.len() < h {
+        lines.push(ratatui::text::Line::from(" ".repeat(w)));
+    }
+
+    frame.render_widget(ratatui::text::Text::from(lines), area);
+
+    // HUD
+    let anim_count = state.animations.values().filter(|a| !matches!(a, NodeAnim::Stable)).count();
+    let status = format!(
+        " entries:{} clusters:{} anims:{} [q]uit [l]abels ",
+        total_entries, leaf_list.len(), anim_count,
+    );
+    let status_widget = ratatui::widgets::Paragraph::new(
+        Span::styled(status, Style::default().fg(Color::DarkGray)),
+    );
+    let bottom = Rect::new(0, area.height.saturating_sub(1), area.width, 1);
+    frame.render_widget(status_widget, bottom);
+
+    // Skip old braille rendering entirely
+    return;
 
     // Braille grid pixel dimensions (2 wide x 4 tall per character)
     let grid_pixel_w = (state.grid_w * 2) as f64;
@@ -702,87 +864,7 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
         }
     }
 
-    // Draw atmosphere around all nodes — color encodes cluster health
-    // Leaf nodes: health from own freshness + proven ratio
-    // Structural nodes: average health of their children
-    for node_idx in state.graph.node_indices() {
-        let node = &state.graph[node_idx];
-        let is_leaf = leaf_nodes.contains(&node_idx);
 
-        let pos = state.physics.position(node_idx);
-        let (px, py) = to_pixel(pos);
-        if px < 0 || py < 0 { continue; }
-        let ux = px as usize;
-        let uy = py as usize;
-        if ux >= state.grid_w * 2 || uy >= state.grid_h * 4 { continue; }
-
-        // Health score: 0.0 = danger, 1.0 = healthy
-        let health = if is_leaf {
-            if node.count <= 0 { continue; }
-            let proven_ratio = 1.0 - (node.unproven as f64 / node.count as f64);
-            (node.freshness as f64 * 0.5 + proven_ratio * 0.5).clamp(0.0, 1.0)
-        } else {
-            // Structural: average health of child nodes
-            let children: Vec<NodeIndex> = state.graph
-                .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
-                .collect();
-            if children.is_empty() { continue; }
-            let sum: f64 = children.iter().map(|&c| {
-                let cn = &state.graph[c];
-                let pr = if cn.count > 0 { 1.0 - (cn.unproven as f64 / cn.count as f64) } else { 1.0 };
-                (cn.freshness as f64 * 0.5 + pr * 0.5).clamp(0.0, 1.0)
-            }).sum();
-            sum / children.len() as f64
-        };
-
-        // Color: teal (healthy) → amber (warning) → magenta (danger)
-        // Chosen for contrast on dark terminals
-        let atmo_color = if health > 0.6 {
-            // Teal/cyan — healthy, calm
-            DotColor::rgb(40, 200, 180)
-        } else if health > 0.3 {
-            // Amber/orange — warning
-            DotColor::rgb(240, 180, 50)
-        } else {
-            // Magenta/pink — danger, visible on dark bg
-            DotColor::rgb(240, 60, 140)
-        };
-
-        // Atmosphere is steady — only brightens when the node is animating (add/delete)
-        let anim = state.animations.get(&node_idx).unwrap_or(&NodeAnim::Stable);
-        let breath = match anim {
-            NodeAnim::Growing { progress } => 0.8 + 0.4 * ((progress * std::f32::consts::PI * 4.0).sin() as f64).abs(),
-            NodeAnim::Shrinking { progress } => 0.8 + 0.4 * ((progress * std::f32::consts::PI * 4.0).sin() as f64).abs(),
-            _ => 0.7, // steady baseline
-        };
-
-        // Atmosphere radius based on node size
-        let count_size = 1 + ((node.count as f64).ln().max(0.0) / 1.5) as usize;
-        let atmo_radius = (count_size as f64 + 5.0 + (node.count as f64).sqrt() * 2.0) as usize;
-
-        // Draw dense cloud of dots filling the atmosphere area
-        let num_atmo_dots = 40 + node.count.min(30) as usize * 3;
-        for i in 0..num_atmo_dots {
-            // Distribute dots across the full disk, denser toward the edge
-            let angle = (i as f64 / num_atmo_dots as f64) * std::f64::consts::TAU
-                + (node.id as f64 * 0.5) + (i as f64 * 1.618); // golden ratio scatter
-            let r_variation = 0.3 + 0.7 * ((i as f64 * 2.7 + state.frame as f64 * 0.005).sin() * 0.5 + 0.5);
-            let r = atmo_radius as f64 * r_variation;
-
-            let ax = (ux as f64 + r * angle.cos()).round() as usize;
-            let ay = (uy as f64 + r * angle.sin()).round() as usize;
-            if ax >= state.grid_w * 2 || ay >= state.grid_h * 4 { continue; }
-
-            // Apply breathing to atmosphere brightness
-            let dot_color = DotColor::rgb(
-                (atmo_color.r as f64 * breath * 0.6) as u8,
-                (atmo_color.g as f64 * breath * 0.6) as u8,
-                (atmo_color.b as f64 * breath * 0.6) as u8,
-            );
-            state.grid.set_dot(ax, ay).ok();
-            state.grid.set_cell_color(ax / 2, ay / 4, dot_color).ok();
-        }
-    }
 
     // Draw nodes as braille dots — sized by entry count
     for node_idx in state.graph.node_indices() {
@@ -858,73 +940,82 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
             }
         }
 
-        // Draw orbiting data point satellites around leaf nodes
-        // Fresh memories orbit actively; old memories slow down and become static
-        // Consolidated memories appear as clumps (2-3 dots stuck together)
-        // Unproven (never-accessed) memories orbit further out — loosely held
+        // Draw entries as a defrag-style rectangular grid of blocks
+        // Packed tight, one block per entry. Color = state.
         if is_leaf && node.count > 0 {
             let proven_count = (node.count - node.consolidated - node.unproven).max(0) as usize;
-            let unproven_count = node.unproven.min(24) as usize;
-            let consol_count = node.consolidated.min(24) as usize;
-            let total_points = (proven_count + unproven_count + consol_count).min(24);
-            let inner_radius = (dot_size as f64) + 3.0 + (node.count as f64).sqrt() * 1.2;
-            let outer_radius = inner_radius * 1.8; // unproven orbit 80% further out
+            let unproven_count = node.unproven.min(40) as usize;
+            let consol_count = node.consolidated.min(40) as usize;
+            let total = (proven_count + unproven_count + consol_count).min(40);
 
-            // Entropy/temperature: fresh = hot vibrating particles, old = cooled, still
-            let temperature = node.freshness as f64; // 0.0 (frozen) → 1.0 (boiling)
-            let jitter_amp = 0.5 + temperature * 4.0; // 0.5px (cold) → 4.5px (hot)
+            // Temperature for jitter
+            let temperature = node.freshness as f64;
+            let jitter_amp = 0.2 + temperature * 1.0;
 
-            for i in 0..total_points {
-                // Classify: proven first, then unproven, then consolidated
+            // Grid dimensions: roughly square, 2px per block with 1px gap
+            let cell = 3; // cell size in braille pixels (2px block + 1px gap)
+            let cols = (total as f64).sqrt().ceil() as usize;
+            let cols = cols.max(1);
+
+            // Center the grid on the node
+            let grid_w = cols * cell;
+            let grid_h = ((total + cols - 1) / cols) * cell;
+            let start_x = ux.saturating_sub(grid_w / 2);
+            let start_y = uy.saturating_sub(grid_h / 2);
+
+            for i in 0..total {
                 let is_unproven = i >= proven_count && i < proven_count + unproven_count;
                 let is_consolidated = i >= proven_count + unproven_count;
 
-                // Fixed base position on a ring (deterministic, no orbit)
-                let base_angle = (i as f64 / total_points as f64) * std::f64::consts::TAU
-                    + (node.id as f64 * 0.7); // per-node offset
+                let col = i % cols;
+                let row = i / cols;
+                let bx = start_x + col * cell;
+                let by = start_y + row * cell;
 
-                // Proven = inner, unproven = outer, consolidated = inner
-                let base_r = if is_unproven { outer_radius } else { inner_radius };
-
-                // Brownian jitter: random-looking vibration from fast sin/cos with unique seeds
+                // Jitter
                 let seed = i as f64 * 7.3 + node.id as f64 * 3.1;
-                let jx = jitter_amp * (state.frame as f64 * 0.15 + seed).sin()
-                       * (state.frame as f64 * 0.23 + seed * 1.7).cos();
-                let jy = jitter_amp * (state.frame as f64 * 0.19 + seed * 2.3).cos()
-                       * (state.frame as f64 * 0.13 + seed * 0.9).sin();
+                let jx = (jitter_amp * (state.frame as f64 * 0.06 + seed).sin()
+                       * (state.frame as f64 * 0.09 + seed * 1.7).cos()) as i32;
+                let jy = (jitter_amp * (state.frame as f64 * 0.07 + seed * 2.3).cos()
+                       * (state.frame as f64 * 0.05 + seed * 0.9).sin()) as i32;
 
-                let cx = ux as f64 + (dot_size as f64 / 2.0) + base_r * base_angle.cos() + jx;
-                let cy = uy as f64 + (dot_size as f64 / 2.0) + base_r * base_angle.sin() + jy;
-
-                if is_consolidated {
-                    // Draw clump: 3 dots stuck together in a tight triangle
-                    let clump_offsets: [(f64, f64); 3] = [(0.0, 0.0), (1.0, 0.0), (0.5, 1.0)];
-                    for (dx, dy) in &clump_offsets {
-                        let sx = (cx + dx).round() as usize;
-                        let sy = (cy + dy).round() as usize;
-                        if sx < state.grid_w * 2 && sy < state.grid_h * 4 {
-                            let sat_color = DotColor::rgb(
-                                (base_depth_color.r as f64 * 0.6) as u8,
-                                (base_depth_color.g as f64 * 0.6) as u8,
-                                (base_depth_color.b as f64 * 0.7) as u8,
-                            );
-                            state.grid.set_dot(sx, sy).ok();
-                            state.grid.set_cell_color(sx / 2, sy / 4, sat_color).ok();
-                        }
-                    }
+                // Color by state
+                let block_color = if is_consolidated {
+                    // Consolidated = distinct cooler tint
+                    DotColor::rgb(
+                        (base_depth_color.r as f64 * 0.5) as u8,
+                        (base_depth_color.g as f64 * 0.5) as u8,
+                        (base_depth_color.b as f64 * 0.7) as u8,
+                    )
+                } else if is_unproven {
+                    // Unproven = dimmer
+                    DotColor::rgb(
+                        (base_depth_color.r as f64 * 0.45) as u8,
+                        (base_depth_color.g as f64 * 0.45) as u8,
+                        (base_depth_color.b as f64 * 0.45) as u8,
+                    )
                 } else {
-                    // Single dot satellite
-                    let sx = cx.round() as usize;
-                    let sy = cy.round() as usize;
-                    if sx < state.grid_w * 2 && sy < state.grid_h * 4 {
-                        let sat_bright = 0.5 + 0.5 * ((base_angle * 2.0 + state.frame as f64 * 0.1).sin()).abs();
-                        let sat_color = DotColor::rgb(
-                            (base_depth_color.r as f64 * (0.5 + 0.5 * sat_bright)) as u8,
-                            (base_depth_color.g as f64 * (0.5 + 0.5 * sat_bright)) as u8,
-                            (base_depth_color.b as f64 * (0.5 + 0.5 * sat_bright)) as u8,
-                        );
-                        state.grid.set_dot(sx, sy).ok();
-                        state.grid.set_cell_color(sx / 2, sy / 4, sat_color).ok();
+                    // Proven = full brightness
+                    DotColor::rgb(
+                        (base_depth_color.r as f64 * 0.9) as u8,
+                        (base_depth_color.g as f64 * 0.9) as u8,
+                        (base_depth_color.b as f64 * 0.9) as u8,
+                    )
+                };
+
+                // Draw 2x2 block with jitter
+                for dx in 0..2_usize {
+                    for dy in 0..2_usize {
+                        let px = (bx + dx) as i32 + jx;
+                        let py = (by + dy) as i32 + jy;
+                        if px >= 0 && py >= 0 {
+                            let px = px as usize;
+                            let py = py as usize;
+                            if px < state.grid_w * 2 && py < state.grid_h * 4 {
+                                state.grid.set_dot(px, py).ok();
+                                state.grid.set_cell_color(px / 2, py / 4, block_color).ok();
+                            }
+                        }
                     }
                 }
             }
