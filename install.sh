@@ -1,62 +1,22 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
-REPO="dincamihai/engram"
-INSTALL_DIR="${ENGRAM_HOME:-$HOME/.engram}"
-ENGRAM_BIN="$INSTALL_DIR/bin/engram"
-HOOKS_DIR="$INSTALL_DIR/hooks"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BINARY="$SCRIPT_DIR/target/release/engram"
+HOOKS_DIR="$SCRIPT_DIR/hooks"
 SETTINGS="$HOME/.claude/settings.local.json"
 
-# Detect platform
-OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
-ARCH="$(uname -m)"
-case "$OS" in
-  linux)  OS="linux" ;;
-  darwin) OS="darwin" ;;
-  *) echo "Unsupported OS: $OS"; exit 1 ;;
-esac
-case "$ARCH" in
-  x86_64|amd64)  ARCH="amd64" ;;
-  aarch64|arm64) ARCH="arm64" ;;
-  *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
-esac
-ARTIFACT="engram-${OS}-${ARCH}"
+echo "[engram] Building release binary..."
+cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml"
 
-# Determine version
-VERSION="${1:-latest}"
-
-echo "==> Downloading engram ($ARTIFACT)..."
-mkdir -p "$INSTALL_DIR/bin" "$INSTALL_DIR/hooks"
-
-if [ "$VERSION" = "latest" ]; then
-  DOWNLOAD_URL="https://github.com/$REPO/releases/latest/download/$ARTIFACT"
-else
-  DOWNLOAD_URL="https://github.com/$REPO/releases/download/$VERSION/$ARTIFACT"
-fi
-
-curl -fSL "$DOWNLOAD_URL" -o "$ENGRAM_BIN"
-chmod +x "$ENGRAM_BIN"
-
-echo "==> Installing hooks..."
-# Download hooks from the repo (use the tag if specified, otherwise main)
-REF="${VERSION:-main}"
-if [ "$REF" = "latest" ]; then REF="main"; fi
-for hook in engram_save_hook.sh engram_precompact_hook.sh engram_session_start_hook.sh engram_post_tool_use_hook.sh; do
-  curl -fSL "https://raw.githubusercontent.com/$REPO/$REF/hooks/$hook" -o "$HOOKS_DIR/$hook"
-  chmod +x "$HOOKS_DIR/$hook"
-  # Patch hook to use installed binary path
-  sed -i.bak "s|ENGRAM=.*|ENGRAM=\"$ENGRAM_BIN\"|" "$HOOKS_DIR/$hook"
-  rm -f "$HOOKS_DIR/$hook.bak"
-done
-
-echo "==> Registering MCP server..."
+echo "[engram] Registering MCP server with Claude Code..."
 claude mcp remove memory --scope user 2>/dev/null || true
 claude mcp add --scope user memory \
-  -e OLLAMA_BASE_URL=http://localhost:11434 \
-  -e OLLAMA_EMBED_MODEL=embeddinggemma \
-  -- "$ENGRAM_BIN" serve
+  -e OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://localhost:11434}" \
+  -e OLLAMA_EMBED_MODEL="${OLLAMA_EMBED_MODEL:-embeddinggemma}" \
+  -- "$BINARY" serve
 
-echo "==> Configuring hooks and permissions..."
+echo "[engram] Configuring hooks and permissions..."
 mkdir -p "$HOME/.claude"
 
 python3 - "$SETTINGS" "$HOOKS_DIR" <<'PYEOF'
@@ -80,18 +40,58 @@ for tool in ["mcp__memory__engram_store", "mcp__memory__engram_search"]:
 
 # Hooks
 hooks = settings.setdefault("hooks", {})
-hooks["Stop"] = [{"hooks": [{"type": "command", "command": f"{hooks_dir}/engram_save_hook.sh"}]}]
-hooks["PreCompact"] = [{"hooks": [{"type": "command", "command": f"{hooks_dir}/engram_precompact_hook.sh"}]}]
-hooks["SessionStart"] = [{"hooks": [{"type": "command", "command": f"{hooks_dir}/engram_session_start_hook.sh", "timeout": 15, "statusMessage": "Loading memories..."}]}]
-hooks["PostToolUse"] = [{"hooks": [{"type": "command", "command": f"{hooks_dir}/engram_post_tool_use_hook.sh"}]}]
+
+# Stop — save session context
+stop_hooks = hooks.setdefault("Stop", [{"hooks": []}])
+if not any("engram_save_hook" in h.get("command", "") for hh in stop_hooks for h in hh.get("hooks", []) if isinstance(hh, dict)):
+    pass
+stop_list = stop_hooks[0] if stop_hooks and isinstance(stop_hooks[0], dict) else {"hooks": []}
+if not isinstance(stop_list, dict):
+    stop_list = {"hooks": []}
+stop_hooks_list = stop_list.setdefault("hooks", [])
+if not any("engram_save_hook" in h.get("command", "") for h in stop_hooks_list):
+    stop_hooks_list.append({"type": "command", "command": f"{hooks_dir}/engram_save_hook.sh"})
+
+# PreCompact — store summary before compaction
+precompact_hooks = hooks.setdefault("PreCompact", [{"hooks": []}])
+pc_list = precompact_hooks[0] if precompact_hooks and isinstance(precompact_hooks[0], dict) else {"hooks": []}
+if not isinstance(pc_list, dict):
+    pc_list = {"hooks": []}
+pc_hooks_list = pc_list.setdefault("hooks", [])
+if not any("engram_precompact_hook" in h.get("command", "") for h in pc_hooks_list):
+    pc_hooks_list.append({"type": "command", "command": f"{hooks_dir}/engram_precompact_hook.sh"})
+
+# SessionStart — inject memories
+session_hooks = hooks.setdefault("SessionStart", [{"hooks": []}])
+ss_list = session_hooks[0] if session_hooks and isinstance(session_hooks[0], dict) else {"hooks": []}
+if not isinstance(ss_list, dict):
+    ss_list = {"hooks": []}
+ss_hooks_list = ss_list.setdefault("hooks", [])
+if not any("engram_session_start_hook" in h.get("command", "") for h in ss_hooks_list):
+    ss_hooks_list.append({"type": "command", "command": f"{hooks_dir}/engram_session_start_hook.sh", "timeout": 15})
+
+# PostToolUse — store + activate (Bash and Agent)
+post_list = hooks.setdefault("PostToolUse", [])
+for tool_name in ["Bash", "Agent"]:
+    matcher = {"toolName": tool_name}
+    existing = next((e for e in post_list if isinstance(e, dict) and e.get("matcher", {}).get("toolName") == tool_name), None)
+    if existing:
+        entry_hooks = existing.setdefault("hooks", [])
+        if not any("engram_post_tool_use_hook" in h.get("command", "") for h in entry_hooks):
+            entry_hooks.append({"type": "command", "command": f"{hooks_dir}/engram_post_tool_use_hook.sh"})
+    else:
+        post_list.append({
+            "matcher": {"toolName": tool_name},
+            "hooks": [{"type": "command", "command": f"{hooks_dir}/engram_post_tool_use_hook.sh"}]
+        })
 
 with open(settings_path, "w") as f:
     json.dump(settings, f, indent=2)
     f.write("\n")
+
+print("[engram] Settings updated.")
 PYEOF
 
 echo ""
-echo "Done! engram installed to $INSTALL_DIR"
-echo ""
-echo "Prerequisites:"
-echo "  ollama pull embeddinggemma"
+echo "[engram] Done! MCP server registered and hooks configured."
+echo "[engram] Make sure Ollama is running with: ollama pull embeddinggemma"

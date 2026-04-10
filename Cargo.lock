@@ -268,6 +268,7 @@ dependencies = [
  "serde",
  "serde_json",
  "stop-words",
+ "termtree",
  "walkdir",
  "yake-rust",
 ]
@@ -1364,6 +1365,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "termtree"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "thiserror"

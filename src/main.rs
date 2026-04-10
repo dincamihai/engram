@@ -50,6 +50,15 @@ enum Commands {
     Rebalance,
     /// Rebuild tree from scratch (re-cluster all entries)
     Rebuild,
+    /// X-ray: visualize tree structure with content
+    Tree {
+        /// Max characters per entry to show
+        #[arg(long, default_value = "80")]
+        width: usize,
+        /// Watch mode: refresh every N seconds
+        #[arg(short, long)]
+        watch: Option<f64>,
+    },
     /// Ingest files from a directory
     Ingest {
         dir: PathBuf,
@@ -194,6 +203,21 @@ fn main() {
             match tree.rebuild() {
                 Ok(msg) => println!("{msg}"),
                 Err(e) => eprintln!("error: {e}"),
+            }
+        }
+
+        Commands::Tree { width, watch } => {
+            let tree = birch::Tree::open(db_str, 768, birch::Config::default())
+                .expect("cannot open tree");
+            if let Some(secs) = watch {
+                let duration = std::time::Duration::from_secs_f64(secs);
+                loop {
+                    print!("\x1B[2J\x1B[H"); // clear screen, move cursor home
+                    print_tree(&tree, width);
+                    std::thread::sleep(duration);
+                }
+            } else {
+                print_tree(&tree, width);
             }
         }
 
@@ -386,6 +410,57 @@ fn print_topics(topics: &[birch::Topic], indent: usize) {
             print_topics(&t.children, indent + 1);
         }
     }
+}
+
+fn print_tree(tree: &birch::Tree, content_limit: usize) {
+    let topic_tree = match tree.topic_tree(content_limit) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return;
+        }
+    };
+    let total = tree.count().unwrap_or(0);
+    println!("engram x-ray — {} entries\n", total);
+    let rendered = render_topic(&topic_tree);
+    println!("{rendered}");
+}
+
+fn render_topic(node: &birch::TopicTree) -> termtree::Tree<String> {
+    let label = if node.label.is_empty() || node.label.starts_with("topic_") {
+        format!("[{}]", node.id)
+    } else {
+        node.label.clone()
+    };
+
+    let mut children: Vec<termtree::Tree<String>> = Vec::new();
+
+    // Add entries as leaves
+    for entry in &node.entries {
+        let access = if entry.access_count > 0 {
+            format!(" (x{})", entry.access_count)
+        } else {
+            String::new()
+        };
+        let source_tag = entry.source
+            .as_deref()
+            .map(|s| format!(" [{}]", s.split('/').last().unwrap_or(s)))
+            .unwrap_or_default();
+        children.push(termtree::Tree::new(format!("#{}{}{} {}", entry.id, source_tag, access, entry.content)));
+    }
+
+    // Add child topics
+    for child in &node.children {
+        children.push(render_topic(child));
+    }
+
+    let count_label = if children.is_empty() && node.entries.is_empty() {
+        label
+    } else {
+        format!("{} ({} entries)", label, node.count)
+    };
+
+    termtree::Tree::new(count_label).with_leaves(children)
 }
 
 fn count_leaves(topics: &[birch::Topic]) -> usize {

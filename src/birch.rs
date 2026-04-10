@@ -59,6 +59,27 @@ pub struct Topic {
     pub children: Vec<Topic>,
 }
 
+/// A single entry within a topic for tree browsing.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TopicEntry {
+    pub id: i64,
+    pub content: String,
+    pub content_display: Option<String>,
+    pub source: Option<String>,
+    pub access_count: i64,
+}
+
+/// Topic with its entries for tree browsing.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TopicTree {
+    pub id: i64,
+    pub label: String,
+    pub count: i64,
+    pub depth: i32,
+    pub entries: Vec<TopicEntry>,
+    pub children: Vec<TopicTree>,
+}
+
 /// The BIRCH tree.
 pub struct Tree {
     conn: Connection,
@@ -1397,6 +1418,105 @@ impl Tree {
         }
 
         Ok(topics)
+    }
+
+    /// Get the full tree with entries for x-ray visualization.
+    pub fn topic_tree(&self, content_limit: usize) -> Result<TopicTree, String> {
+        let root_id = self.root_id()?;
+        self.topic_tree_under(root_id, content_limit)
+    }
+
+    fn topic_tree_under(&self, node_id: i64, content_limit: usize) -> Result<TopicTree, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, label, count, depth FROM nodes WHERE id = ?1")
+            .map_err(|e| format!("prepare tree node: {e}"))?;
+
+        let (id, label, count, depth): (i64, String, i64, i32) = stmt
+            .query_map(params![node_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .map_err(|e| format!("query tree node: {e}"))?
+            .filter_map(|r| r.ok())
+            .next()
+            .ok_or_else(|| "node not found".to_string())?;
+
+        // Get entries for this node
+        let entries = self.node_entries(node_id, content_limit)?;
+
+        // Get children
+        let mut child_stmt = self
+            .conn
+            .prepare("SELECT id FROM nodes WHERE parent_id = ?1")
+            .map_err(|e| format!("prepare children: {e}"))?;
+
+        let child_ids: Vec<i64> = child_stmt
+            .query_map(params![node_id], |row| row.get(0))
+            .map_err(|e| format!("query children: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let children: Vec<TopicTree> = child_ids
+            .iter()
+            .filter_map(|&cid| self.topic_tree_under(cid, content_limit).ok())
+            .collect();
+
+        let entry_count = if children.is_empty() {
+            entries.len() as i64
+        } else {
+            count
+        };
+
+        Ok(TopicTree {
+            id,
+            label,
+            count: entry_count,
+            depth,
+            entries,
+            children,
+        })
+    }
+
+    fn node_entries(&self, node_id: i64, content_limit: usize) -> Result<Vec<TopicEntry>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, content, content_display, source, access_count \
+                 FROM entries WHERE node_id = ?1 ORDER BY created_at DESC",
+            )
+            .map_err(|e| format!("prepare entries: {e}"))?;
+
+        let entries: Vec<TopicEntry> = stmt
+            .query_map(params![node_id], |row| {
+                let id: i64 = row.get(0)?;
+                let content: String = row.get(1)?;
+                let content_display: Option<String> = row.get(2)?;
+                let source: Option<String> = row.get(3)?;
+                let access_count: i64 = row.get(4)?;
+                Ok((id, content, content_display, source, access_count))
+            })
+            .map_err(|e| format!("query entries: {e}"))?
+            .filter_map(|r| r.ok())
+            .map(|(id, content, content_display, source, access_count)| {
+                // Prefer compressed display, truncate to limit
+                let display = content_display.as_deref().unwrap_or(&content);
+                let truncated = if display.chars().count() > content_limit {
+                    let s: String = display.chars().take(content_limit).collect();
+                    format!("{s}...")
+                } else {
+                    display.to_string()
+                };
+                TopicEntry {
+                    id,
+                    content: truncated,
+                    content_display: None, // already applied
+                    source,
+                    access_count,
+                }
+            })
+            .collect();
+
+        Ok(entries)
     }
 }
 
