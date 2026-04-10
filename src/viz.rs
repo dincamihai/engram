@@ -35,6 +35,8 @@ struct VizNode {
     access: i64,
     /// Freshness: 1.0 = just touched, 0.0 = very old. Based on most recent entry age.
     freshness: f32,
+    /// Number of consolidated (merged) entries in this node.
+    consolidated: i64,
 }
 
 /// Animation state for a node.
@@ -124,6 +126,7 @@ fn build_state(tree: &birch::Tree, width: usize, height: usize) -> Result<VizSta
             .unwrap_or(720.0);
         let freshness = (1.0 / (1.0 + age_hours / 72.0)) as f32; // half-life = 3 days
 
+        let consolidated = tree.node_consolidated_count(node.id).unwrap_or(0);
         let viz_node = VizNode {
             id: node.id,
             label: node.label.clone(),
@@ -131,6 +134,7 @@ fn build_state(tree: &birch::Tree, width: usize, height: usize) -> Result<VizSta
             depth: node.depth,
             access,
             freshness,
+            consolidated,
         };
         let idx = graph.add_node(viz_node);
         node_map.push((node.id, idx));
@@ -255,6 +259,7 @@ fn poll_changes(state: &mut VizState, db_path: &str) -> Result<(), Box<dyn std::
                 .unwrap_or(None)
                 .unwrap_or(0.0);
             let freshness = (1.0 / (1.0 + age_hours / 72.0)) as f32;
+            let consolidated = tree.node_consolidated_count(node.id).unwrap_or(0);
             let viz_node = VizNode {
                 id: node.id,
                 label: node.label.clone(),
@@ -262,6 +267,7 @@ fn poll_changes(state: &mut VizState, db_path: &str) -> Result<(), Box<dyn std::
                 depth: node.depth,
                 access,
                 freshness,
+                consolidated,
             };
             let idx = state.graph.add_node(viz_node);
             // Add edge to parent if parent exists in graph
@@ -740,33 +746,61 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
         }
 
         // Draw orbiting data point satellites around leaf nodes
+        // Fresh memories orbit actively; old memories slow down and become static
+        // Consolidated memories appear as clumps (2-3 dots stuck together)
         if is_leaf && node.count > 0 {
-            let num_points = node.count.min(24) as usize;
+            let normal_count = (node.count - node.consolidated).max(0) as usize;
+            let consol_count = node.consolidated.min(24) as usize;
+            let total_points = (normal_count + consol_count).min(24);
             let orbit_radius = (dot_size as f64) + 3.0 + (node.count as f64).sqrt() * 1.5;
-            // Each satellite orbits at its own speed; use frame counter + node id for variety
-            let orbit_base = state.frame as f64 * 0.015 + (node.id as f64 * 0.7);
 
-            for i in 0..num_points {
-                let base_angle = (i as f64 / num_points as f64) * std::f64::consts::TAU;
-                // Each point orbits slowly; stagger speed by index
+            // Orbit speed scales with freshness: fresh = lively, old = nearly frozen
+            let orbit_speed = 0.002 + 0.02 * node.freshness as f64; // 0.002 (static) → 0.022 (fast)
+            let orbit_base = state.frame as f64 * orbit_speed + (node.id as f64 * 0.7);
+            // Wobble amplitude also scales: fresh = organic wobble, old = rigid
+            let wobble_amp = 0.02 + 0.15 * node.freshness as f64;
+
+            for i in 0..total_points {
+                let is_consolidated = i >= normal_count;
+                let base_angle = (i as f64 / total_points as f64) * std::f64::consts::TAU;
                 let speed = 1.0 + (i as f64 * 0.1);
                 let angle = base_angle + orbit_base * speed;
-                // Slight radial wobble for organic feel
-                let wobble = 1.0 + 0.15 * ((orbit_base * 2.0 + i as f64 * 1.3).sin());
+                let wobble = 1.0 + wobble_amp * ((orbit_base * 2.0 + i as f64 * 1.3).sin());
                 let r = orbit_radius * wobble;
 
-                let sx = (ux as f64 + (dot_size as f64 / 2.0) + r * angle.cos()).round() as usize;
-                let sy = (uy as f64 + (dot_size as f64 / 2.0) + r * angle.sin()).round() as usize;
-                if sx < state.grid_w * 2 && sy < state.grid_h * 4 {
-                    // Satellite color: slightly dimmer version of node color
-                    let sat_bright = 0.5 + 0.5 * ((angle * 2.0).sin()).abs(); // twinkle
-                    let sat_color = DotColor::rgb(
-                        (base_depth_color.r as f64 * (0.5 + 0.5 * sat_bright)) as u8,
-                        (base_depth_color.g as f64 * (0.5 + 0.5 * sat_bright)) as u8,
-                        (base_depth_color.b as f64 * (0.5 + 0.5 * sat_bright)) as u8,
-                    );
-                    state.grid.set_dot(sx, sy).ok();
-                    state.grid.set_cell_color(sx / 2, sy / 4, sat_color).ok();
+                let cx = ux as f64 + (dot_size as f64 / 2.0) + r * angle.cos();
+                let cy = uy as f64 + (dot_size as f64 / 2.0) + r * angle.sin();
+
+                if is_consolidated {
+                    // Draw clump: 3 dots stuck together in a tight triangle
+                    let clump_offsets: [(f64, f64); 3] = [(0.0, 0.0), (1.0, 0.0), (0.5, 1.0)];
+                    for (dx, dy) in &clump_offsets {
+                        let sx = (cx + dx).round() as usize;
+                        let sy = (cy + dy).round() as usize;
+                        if sx < state.grid_w * 2 && sy < state.grid_h * 4 {
+                            let sat_color = DotColor::rgb(
+                                (base_depth_color.r as f64 * 0.6) as u8,
+                                (base_depth_color.g as f64 * 0.6) as u8,
+                                (base_depth_color.b as f64 * 0.7) as u8,
+                            );
+                            state.grid.set_dot(sx, sy).ok();
+                            state.grid.set_cell_color(sx / 2, sy / 4, sat_color).ok();
+                        }
+                    }
+                } else {
+                    // Single dot satellite
+                    let sx = cx.round() as usize;
+                    let sy = cy.round() as usize;
+                    if sx < state.grid_w * 2 && sy < state.grid_h * 4 {
+                        let sat_bright = 0.5 + 0.5 * ((angle * 2.0).sin()).abs();
+                        let sat_color = DotColor::rgb(
+                            (base_depth_color.r as f64 * (0.5 + 0.5 * sat_bright)) as u8,
+                            (base_depth_color.g as f64 * (0.5 + 0.5 * sat_bright)) as u8,
+                            (base_depth_color.b as f64 * (0.5 + 0.5 * sat_bright)) as u8,
+                        );
+                        state.grid.set_dot(sx, sy).ok();
+                        state.grid.set_cell_color(sx / 2, sy / 4, sat_color).ok();
+                    }
                 }
             }
         }

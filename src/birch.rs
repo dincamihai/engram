@@ -1571,6 +1571,17 @@ impl Tree {
             .map_err(|e| format!("node_total_access: {e}"))
     }
 
+    /// Returns the number of consolidated entries in a node.
+    pub fn node_consolidated_count(&self, node_id: i64) -> Result<i64, String> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE node_id = ?1 AND source = 'consolidated'",
+                rusqlite::params![node_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("node_consolidated_count: {e}"))
+    }
+
     /// Returns the age in hours of the most recent entry in a node.
     /// 0.0 = just created, larger = older. Returns None if no entries.
     pub fn node_freshness_hours(&self, node_id: i64) -> Result<Option<f64>, String> {
