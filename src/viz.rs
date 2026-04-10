@@ -575,6 +575,7 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
         if lines.len() >= h { break; }
 
         let mut spans: Vec<Span> = Vec::with_capacity(w);
+        let mut col = 0usize; // track visual column count
 
         // Label with freshness color of first block
         let label_color = if let Some(b) = cluster.first() {
@@ -584,11 +585,12 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
             Color::DarkGray
         };
         let padded_label = format!("{:>width$} ", label, width = label_width - 1);
+        col += padded_label.len();
         spans.push(Span::styled(padded_label, Style::default().fg(label_color)));
 
         // Blocks
         for (_i, b) in cluster.iter().enumerate() {
-            if spans.len() >= w { break; }
+            if col >= w { break; }
 
             let (r, g, bl) = if let Some((ar, ag, ab)) = b.anim_color {
                 (ar, ag, ab)
@@ -611,10 +613,12 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
             let bl = (bl as f64 * flicker).min(255.0) as u8;
 
             spans.push(Span::styled("█", Style::default().fg(Color::Rgb(r, g, bl))));
+            col += 1;
         }
 
         // Fill remaining with spaces
-        while spans.len() < w {
+        while col < w {
+            col += 1;
             spans.push(Span::raw(" "));
         }
 
