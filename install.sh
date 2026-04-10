@@ -3,94 +3,145 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINARY="$SCRIPT_DIR/target/release/engram"
-HOOKS_DIR="$SCRIPT_DIR/hooks"
-SETTINGS="$HOME/.claude/settings.local.json"
+CLAUDE_HOOKS="$HOME/.claude/hooks"
 
 echo "[engram] Building release binary..."
 cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml"
 
 echo "[engram] Registering MCP server with Claude Code..."
 claude mcp remove memory --scope user 2>/dev/null || true
-claude mcp add --scope user memory \
-  -e OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://localhost:11434}" \
-  -e OLLAMA_EMBED_MODEL="${OLLAMA_EMBED_MODEL:-embeddinggemma}" \
-  -- "$BINARY" serve
+claude mcp add --scope user memory -- "$BINARY" serve
 
-echo "[engram] Configuring hooks and permissions..."
-mkdir -p "$HOME/.claude"
+echo "[engram] Installing hooks..."
+mkdir -p "$CLAUDE_HOOKS"
 
-python3 - "$SETTINGS" "$HOOKS_DIR" <<'PYEOF'
-import json, sys, os
+# SessionStart — load memories
+cat > "$CLAUDE_HOOKS/engram-session-start.sh" <<'HOOK'
+#!/bin/bash
+ENGRAM=~/Repos/engram/target/release/engram
+WORKDIR=$(basename "$PWD")
+TODAY=$(date +%Y-%m-%d)
+MONTH=$(date +"%B %Y")
+QUERY="$MONTH recent work context $TODAY $WORKDIR"
+RESULT=$($ENGRAM search "$QUERY" --limit 10 2>/dev/null | head -120)
+if [ -n "$RESULT" ]; then
+  ESCAPED=$(echo "$RESULT" | python3 -c "import sys,json; s=json.dumps(sys.stdin.read()); print(s[1:-1])")
+  echo "{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"== Engram Memory (auto-loaded) ==\n${ESCAPED}\n== End Engram Memory ==\"}}"
+fi
+exit 0
+HOOK
 
-settings_path = sys.argv[1]
-hooks_dir = sys.argv[2]
+# PreCompact — save summary before compaction
+cat > "$CLAUDE_HOOKS/engram-pre-compact.sh" <<'HOOK'
+#!/bin/bash
+ENGRAM=~/Repos/engram/target/release/engram
+SUMMARY=$(cat | head -c 2000)
+if [ -n "$SUMMARY" ]; then
+    $ENGRAM queue "$SUMMARY" --source pre-compact 2>/dev/null
+fi
+echo '{"decision":"approve"}'
+exit 0
+HOOK
 
+# PostToolUse/Bash — queue git push + jira
+cat > "$CLAUDE_HOOKS/engram-post-bash.sh" <<'HOOK'
+#!/bin/bash
+INPUT=$(cat)
+CMD=$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
+CWD=$(echo "$INPUT" | jq -r '.cwd // "."' 2>/dev/null)
+ENGRAM=~/Repos/engram/target/release/engram
+if echo "$CMD" | grep -qE 'git push'; then
+    BRANCH=$(cd "$CWD" && git branch --show-current 2>/dev/null)
+    MSG=$(cd "$CWD" && git log -1 --format='%s' 2>/dev/null)
+    [ -n "$MSG" ] && $ENGRAM queue "Pushed $BRANCH: $MSG" --source git-hook 2>/dev/null
+elif echo "$CMD" | grep -qE 'acli jira'; then
+    TICKET=$(echo "$CMD" | grep -oE 'L3-[0-9]+|SPOT-[0-9]+')
+    [ -n "$TICKET" ] && $ENGRAM queue "Investigated Jira ticket $TICKET" --source jira-hook 2>/dev/null
+fi
+exit 0
+HOOK
+
+# PostToolUse/Edit — queue vault edits
+cat > "$CLAUDE_HOOKS/engram-post-edit.sh" <<'HOOK'
+#!/bin/bash
+INPUT=$(cat)
+FILE=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty' 2>/dev/null)
+ENGRAM=~/Repos/engram/target/release/engram
+if echo "$FILE" | grep -q '/exasol/'; then
+    CONTENT=$(echo "$INPUT" | jq -r '.tool_input.new_string // empty' 2>/dev/null | head -c 500)
+    [ -n "$CONTENT" ] && $ENGRAM queue "$CONTENT" --source vault-hook 2>/dev/null
+fi
+exit 0
+HOOK
+
+# UserPromptSubmit — queue substantial prompts
+cat > "$CLAUDE_HOOKS/engram-user-prompt.sh" <<'HOOK'
+#!/bin/bash
+INPUT=$(cat)
+PROMPT=$(echo "$INPUT" | jq -r '.prompt // empty' 2>/dev/null | head -c 300)
+if [ ${#PROMPT} -gt 30 ]; then
+    ~/Repos/engram/target/release/engram queue "$PROMPT" --source user-prompt 2>/dev/null
+fi
+exit 0
+HOOK
+
+# Stop — queue session summary
+cat > "$CLAUDE_HOOKS/engram-post-stop.sh" <<'HOOK'
+#!/bin/bash
+INPUT=$(cat)
+SUMMARY=$(echo "$INPUT" | jq -r '.transcript_summary // .summary // empty' 2>/dev/null | head -c 500)
+if [ -n "$SUMMARY" ]; then
+    ~/Repos/engram/target/release/engram queue "$SUMMARY" --source session-end 2>/dev/null
+fi
+exit 0
+HOOK
+
+# SubagentStop — queue agent results
+cat > "$CLAUDE_HOOKS/engram-subagent-stop.sh" <<'HOOK'
+#!/bin/bash
+INPUT=$(cat)
+RESULT=$(echo "$INPUT" | jq -r '.result // empty' 2>/dev/null | head -c 500)
+if [ -n "$RESULT" ]; then
+    ~/Repos/engram/target/release/engram queue "$RESULT" --source subagent 2>/dev/null
+fi
+exit 0
+HOOK
+
+chmod +x "$CLAUDE_HOOKS"/engram-*.sh
+
+echo "[engram] Configuring settings..."
+python3 - <<'PYEOF'
+import json, os
+
+settings_path = os.path.expanduser("~/.claude/settings.json")
 if os.path.exists(settings_path):
     with open(settings_path) as f:
         settings = json.load(f)
 else:
     settings = {}
 
-# Permissions
-perms = settings.setdefault("permissions", {})
-allow = perms.setdefault("allow", [])
-for tool in ["mcp__memory__engram_store", "mcp__memory__engram_search"]:
-    if tool not in allow:
-        allow.append(tool)
-
-# Hooks
+hooks_dir = os.path.expanduser("~/.claude/hooks")
 hooks = settings.setdefault("hooks", {})
 
-# Stop — save session context
-stop_hooks = hooks.setdefault("Stop", [{"hooks": []}])
-if not any("engram_save_hook" in h.get("command", "") for hh in stop_hooks for h in hh.get("hooks", []) if isinstance(hh, dict)):
-    pass
-stop_list = stop_hooks[0] if stop_hooks and isinstance(stop_hooks[0], dict) else {"hooks": []}
-if not isinstance(stop_list, dict):
-    stop_list = {"hooks": []}
-stop_hooks_list = stop_list.setdefault("hooks", [])
-if not any("engram_save_hook" in h.get("command", "") for h in stop_hooks_list):
-    stop_hooks_list.append({"type": "command", "command": f"{hooks_dir}/engram_save_hook.sh"})
+hooks["SessionStart"] = [{"hooks": [{"type": "command", "command": f"{hooks_dir}/engram-session-start.sh", "timeout": 15, "statusMessage": "Loading memories..."}]}]
+hooks["PreCompact"] = [{"hooks": [{"type": "command", "command": f"{hooks_dir}/engram-pre-compact.sh"}]}]
+hooks["Stop"] = [{"hooks": [{"type": "command", "command": f"{hooks_dir}/engram-post-stop.sh", "timeout": 5}]}]
+hooks["UserPromptSubmit"] = [{"hooks": [{"type": "command", "command": f"{hooks_dir}/engram-user-prompt.sh", "timeout": 5}]}]
+hooks["SubagentStop"] = [{"hooks": [{"type": "command", "command": f"{hooks_dir}/engram-subagent-stop.sh", "timeout": 5}]}]
 
-# PreCompact — store summary before compaction
-precompact_hooks = hooks.setdefault("PreCompact", [{"hooks": []}])
-pc_list = precompact_hooks[0] if precompact_hooks and isinstance(precompact_hooks[0], dict) else {"hooks": []}
-if not isinstance(pc_list, dict):
-    pc_list = {"hooks": []}
-pc_hooks_list = pc_list.setdefault("hooks", [])
-if not any("engram_precompact_hook" in h.get("command", "") for h in pc_hooks_list):
-    pc_hooks_list.append({"type": "command", "command": f"{hooks_dir}/engram_precompact_hook.sh"})
-
-# SessionStart — inject memories
-session_hooks = hooks.setdefault("SessionStart", [{"hooks": []}])
-ss_list = session_hooks[0] if session_hooks and isinstance(session_hooks[0], dict) else {"hooks": []}
-if not isinstance(ss_list, dict):
-    ss_list = {"hooks": []}
-ss_hooks_list = ss_list.setdefault("hooks", [])
-if not any("engram_session_start_hook" in h.get("command", "") for h in ss_hooks_list):
-    ss_hooks_list.append({"type": "command", "command": f"{hooks_dir}/engram_session_start_hook.sh", "timeout": 15})
-
-# PostToolUse — store + activate (Bash and Agent)
-post_list = hooks.setdefault("PostToolUse", [])
-for tool_name in ["Bash", "Agent"]:
-    existing = next((e for e in post_list if isinstance(e, dict) and e.get("matcher") == tool_name), None)
-    if existing:
-        entry_hooks = existing.setdefault("hooks", [])
-        if not any("engram_post_tool_use_hook" in h.get("command", "") for h in entry_hooks):
-            entry_hooks.append({"type": "command", "command": f"{hooks_dir}/engram_post_tool_use_hook.sh"})
-    else:
-        post_list.append({
-            "matcher": tool_name,
-            "hooks": [{"type": "command", "command": f"{hooks_dir}/engram_post_tool_use_hook.sh"}]
-        })
+post = hooks.setdefault("PostToolUse", [])
+# Remove old entries, add new
+post[:] = [e for e in post if e.get("matcher") not in ("Bash", "Edit")]
+post.append({"matcher": "Bash", "hooks": [{"type": "command", "command": f"{hooks_dir}/engram-post-bash.sh", "timeout": 5}]})
+post.append({"matcher": "Edit", "hooks": [{"type": "command", "command": f"{hooks_dir}/engram-post-edit.sh", "timeout": 5}]})
 
 with open(settings_path, "w") as f:
     json.dump(settings, f, indent=2)
-    f.write("\n")
 
 print("[engram] Settings updated.")
 PYEOF
 
 echo ""
-echo "[engram] Done! MCP server registered and hooks configured."
-echo "[engram] Make sure Ollama is running with: ollama pull embeddinggemma"
+echo "[engram] Done! No external dependencies needed."
+echo "[engram] Models download automatically on first use (~33MB embeddings, ~250MB classifier)."
+echo "[engram] Run 'engram rebuild' if migrating from an older version."
