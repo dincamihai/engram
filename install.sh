@@ -73,15 +73,14 @@ if not any("engram_session_start_hook" in h.get("command", "") for h in ss_hooks
 # PostToolUse — store + activate (Bash and Agent)
 post_list = hooks.setdefault("PostToolUse", [])
 for tool_name in ["Bash", "Agent"]:
-    matcher = {"toolName": tool_name}
-    existing = next((e for e in post_list if isinstance(e, dict) and e.get("matcher", {}).get("toolName") == tool_name), None)
+    existing = next((e for e in post_list if isinstance(e, dict) and e.get("matcher") == tool_name), None)
     if existing:
         entry_hooks = existing.setdefault("hooks", [])
         if not any("engram_post_tool_use_hook" in h.get("command", "") for h in entry_hooks):
             entry_hooks.append({"type": "command", "command": f"{hooks_dir}/engram_post_tool_use_hook.sh"})
     else:
         post_list.append({
-            "matcher": {"toolName": tool_name},
+            "matcher": tool_name,
             "hooks": [{"type": "command", "command": f"{hooks_dir}/engram_post_tool_use_hook.sh"}]
         })
 

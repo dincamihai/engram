@@ -909,7 +909,7 @@ impl Tree {
                 match emb.embed(condensed) {
                     Ok(embedding) => {
                         let source = Some("consolidated");
-                        let epoch = earliest.map(|e| e.timestamp()).unwrap_or_else(|| now.timestamp());
+                        let _epoch = earliest.map(|e| e.timestamp()).unwrap_or_else(|| now.timestamp());
                         let dated = format!("{}: {}", date_prefix, condensed);
                         match self.store(&dated, &embedding, source) {
                             Ok(_) => {}

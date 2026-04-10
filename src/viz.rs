@@ -16,7 +16,6 @@ use dotmax::primitives::{draw_line, draw_line_colored};
 use dotmax::BrailleGrid;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
-use petgraph::Direction;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -32,6 +31,7 @@ struct VizNode {
     label: String,
     count: i64,
     depth: i32,
+    #[allow(dead_code)]
     access: i64,
 }
 
@@ -43,6 +43,7 @@ enum NodeAnim {
     /// Node lost entries — red color fading out.
     Shrinking { progress: f32 },
     /// Branch vibration — node shakes slightly (reserved for future use).
+    #[allow(dead_code)]
     Vibrating { progress: f32 },
     /// Normal, stable.
     Stable,
