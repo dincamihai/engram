@@ -671,73 +671,73 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState, db_path: &str)
     }
     let cursor_idx = state.cursor;
 
-    // Flow blocks inline like words in a paragraph.
-    // Each block is ceil(entries/block_h) wide × block_h tall. 1-char gap between blocks.
-    // When the next block doesn't fit, wrap to the next row of blocks.
-    let block_h = 3usize; // rows tall per block
-    let gap = 1usize;
+    // Brain scan: one solid █ block, each cell colored by which cluster owns it.
+    // Clusters are laid out contiguously — each gets N cells proportional to entry count.
+    // Baseline is dim, activity (anim) lights up regions, cursor highlights a region.
 
-    // Single-dot characters that rotate position — one dot per entry
-    const SPINNER: &[&str] = &["⠁","⠈","⠐","⠠","⢀","⡀","⠄","⠂"];
+    // Total cells in the solid block
+    let total_cells: usize = cluster_blocks.iter().map(|(_, _, c)| c.len()).sum();
 
-    // Pre-compute each block's width
-    struct BlockLayout { idx: usize, bw: usize }
-    let mut layouts: Vec<BlockLayout> = Vec::new();
+    // Target a roughly 2:1 width:height rectangle (chars are ~2x tall)
+    // Aspect ratio ~3:1 width:height so it looks square (chars are ~2x tall)
+    let block_w = ((total_cells as f64 * 3.0).sqrt() as usize)
+        .clamp(10, w.saturating_sub(4));
+    let block_h = ((total_cells + block_w - 1) / block_w).max(1);
+
+    // Center on screen
+    let pad_x = w.saturating_sub(block_w) / 2;
+    let pad_y = h.saturating_sub(block_h) / 2;
+
+    // Build a flat cell map: for each cell, which cluster index owns it
+    let mut cell_cluster: Vec<usize> = Vec::with_capacity(total_cells);
+    let mut cell_entry: Vec<usize> = Vec::with_capacity(total_cells); // entry index within cluster
     for (idx, (_, _, cluster)) in cluster_blocks.iter().enumerate() {
-        let snap = 2usize;
-        let raw_w = ((cluster.len() + block_h - 1) / block_h).max(1);
-        let bw = if raw_w <= snap { raw_w } else { ((raw_w + snap - 1) / snap) * snap };
-        layouts.push(BlockLayout { idx, bw });
-    }
-
-    // Compute total content width to find a good rectangle
-    let total_content: usize = layouts.iter().map(|l| l.bw).sum::<usize>()
-        + if num_clusters > 1 { (num_clusters - 1) * gap } else { 0 };
-
-    // Target: a rectangle that fits in the screen, roughly square-ish in character aspect
-    // Characters are ~2x taller than wide, so ideal ratio is width ≈ 2 * height (in chars)
-    // Try wrap widths from sqrt-based estimate, pick one that fits in h
-    let cell_h = block_h + 1; // block rows + gap row
-    let target_w = {
-        // Start from a width that would make it roughly square visually
-        let approx = ((total_content as f64 * cell_h as f64 * 2.0).sqrt() as usize).max(20);
-        // Clamp to screen
-        approx.min(w)
-    };
-
-    // Pack blocks into rows (word-wrap to target_w)
-    let mut row_groups: Vec<Vec<usize>> = Vec::new();
-    {
-        let mut current_row: Vec<usize> = Vec::new();
-        let mut x = 0usize;
-        for (li, layout) in layouts.iter().enumerate() {
-            let needed = layout.bw + if current_row.is_empty() { 0 } else { gap };
-            if !current_row.is_empty() && x + needed > target_w {
-                row_groups.push(std::mem::take(&mut current_row));
-                x = 0;
-            }
-            if !current_row.is_empty() { x += gap; }
-            x += layout.bw;
-            current_row.push(li);
+        for ei in 0..cluster.len() {
+            cell_cluster.push(idx);
+            cell_entry.push(ei);
         }
-        if !current_row.is_empty() { row_groups.push(current_row); }
     }
 
-    // Find the actual max row width for centering
-    let actual_w: usize = row_groups.iter().map(|row| {
-        let content: usize = row.iter().map(|&li| layouts[li].bw).sum();
-        let gaps = if row.len() > 1 { (row.len() - 1) * gap } else { 0 };
-        content + gaps
-    }).max().unwrap_or(0);
+    // For cursor nav: estimate grid columns
+    state.layout_cols = block_w;
+    state.layout_rows = (num_clusters + block_w - 1) / block_w;
 
-    // For cursor nav: store how many blocks per visual row
-    state.layout_cols = if !row_groups.is_empty() { row_groups[0].len() } else { 1 };
-    state.layout_rows = row_groups.len();
+    // Precompute animation epicenters: center (row, col) and color/intensity for each active cluster
+    struct Ripple { center_row: f64, center_col: f64, r: u8, g: u8, b: u8, progress: f32 }
+    let mut ripples: Vec<Ripple> = Vec::new();
+    {
+        let mut cell_offset = 0usize;
+        for (idx, (_, _, cluster)) in cluster_blocks.iter().enumerate() {
+            let count = cluster.len();
+            if count == 0 { cell_offset += count; continue; }
+            // Check if this cluster has an active animation
+            if let Some((ar, ag, ab)) = cluster.first().and_then(|b| b.anim_color) {
+                // Find center cell of this cluster's region
+                let mid = cell_offset + count / 2;
+                let center_row = (mid / block_w) as f64;
+                let center_col = (mid % block_w) as f64;
+                // Get animation progress (0.0 = just started, 1.0 = done)
+                let progress = match cluster.first().and_then(|_| {
+                    // Find the node animation for this cluster
+                    let node_idx = leaf_list.iter()
+                        .filter(|&&ni| state.graph[ni].count > 0)
+                        .nth(idx);
+                    node_idx.and_then(|&ni| state.animations.get(&ni))
+                }) {
+                    Some(NodeAnim::Growing { progress }) => *progress,
+                    Some(NodeAnim::Shrinking { progress }) => *progress,
+                    _ => 1.0,
+                };
+                ripples.push(Ripple { center_row, center_col, r: ar, g: ag, b: ab, progress });
+            }
+            cell_offset += count;
+        }
+    }
 
-    // Centering offsets
-    let pad_x = w.saturating_sub(actual_w) / 2;
-    let total_rows = row_groups.len() * cell_h;
-    let pad_y = h.saturating_sub(total_rows) / 2;
+    // Baseline dim color
+    let base_r = 30u8;
+    let base_g = 35u8;
+    let base_bl = 50u8;
 
     let mut lines: Vec<ratatui::text::Line> = Vec::with_capacity(h);
 
@@ -746,84 +746,86 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState, db_path: &str)
         lines.push(ratatui::text::Line::from(" ".repeat(w)));
     }
 
-    for row_group in &row_groups {
-        for cy in 0..block_h {
-            if lines.len() >= h { break; }
-            let mut spans: Vec<Span> = Vec::with_capacity(w);
-            let mut col = 0usize;
+    for row in 0..block_h {
+        if lines.len() >= h { break; }
+        let mut spans: Vec<Span> = Vec::with_capacity(w);
 
-            // Left padding
-            if pad_x > 0 {
-                spans.push(Span::raw(" ".repeat(pad_x)));
-                col += pad_x;
-            }
+        // Left padding
+        if pad_x > 0 {
+            spans.push(Span::raw(" ".repeat(pad_x)));
+        }
 
-            for (gi, &li) in row_group.iter().enumerate() {
-                let layout = &layouts[li];
-                let idx = layout.idx;
-                let bw = layout.bw;
-                let (_, _, ref cluster) = cluster_blocks[idx];
-                let is_cursor = idx == cursor_idx;
+        for col in 0..block_w {
+            let cell_idx = row * block_w + col;
+            if cell_idx < total_cells {
+                let cidx = cell_cluster[cell_idx];
+                let b = &cluster_blocks[cidx].2[cell_entry[cell_idx]];
+                let is_cursor = cidx == cursor_idx;
 
-                // Gap before block (except first in row)
-                if gi > 0 && col < w {
-                    spans.push(Span::raw(" "));
-                    col += 1;
-                }
+                // Start with baseline + subtle freshness tint
+                let (fr, fg, fbl) = freshness_rgb(b.freshness);
+                let mix = 0.15;
+                let mut r = (base_r as f64 * (1.0 - mix) + fr as f64 * mix) as f64;
+                let mut g = (base_g as f64 * (1.0 - mix) + fg as f64 * mix) as f64;
+                let mut bl = (base_bl as f64 * (1.0 - mix) + fbl as f64 * mix) as f64;
 
-                for cx in 0..bw {
-                    if col >= w { break; }
-                    let entry_idx = cy * bw + cx;
-                    if entry_idx < cluster.len() {
-                        let b = cluster[entry_idx];
+                // Apply ripples from all active animations
+                for ripple in &ripples {
+                    let dr = row as f64 - ripple.center_row;
+                    let dc = col as f64 - ripple.center_col;
+                    let dist = (dr * dr + dc * dc).sqrt();
 
-                        let (r, g, bl) = if let Some((ar, ag, ab)) = b.anim_color {
-                            (ar, ag, ab)
-                        } else if b.is_consolidated {
-                            let (r, g, bl) = freshness_rgb(b.freshness);
-                            ((r as f64 * 0.5) as u8, (g as f64 * 0.5) as u8, (bl as f64 * 0.7) as u8)
-                        } else if b.is_unproven {
-                            let (r, g, bl) = freshness_rgb(b.freshness);
-                            ((r as f64 * 0.4) as u8, (g as f64 * 0.4) as u8, (bl as f64 * 0.4) as u8)
-                        } else {
-                            freshness_rgb(b.freshness)
-                        };
+                    // Ripple ring: expanding wavefront based on progress
+                    // Wavefront radius grows with progress, ring width is ~3 cells
+                    let max_radius = 20.0;
+                    let wavefront = ripple.progress as f64 * max_radius;
+                    let ring_dist = (dist - wavefront).abs();
+                    let ring_width = 3.0;
 
-                        let flicker_speed = 0.02 + 0.12 * b.freshness as f64;
-                        let jitter = (state.frame as f64 * flicker_speed + b.seed).sin();
-                        let flicker = if b.is_unproven && b.freshness > 0.8 && jitter > 0.7 { 1.3 } else { 1.0 };
-                        let r = (r as f64 * flicker).min(255.0) as u8;
-                        let g = (g as f64 * flicker).min(255.0) as u8;
-                        let bl = (bl as f64 * flicker).min(255.0) as u8;
+                    if ring_dist < ring_width {
+                        // Intensity: strongest at wavefront, fades with distance from ring
+                        let ring_intensity = 1.0 - ring_dist / ring_width;
+                        // Also fade out as animation progresses
+                        let fade = 1.0 - ripple.progress as f64;
+                        let intensity = ring_intensity * fade;
 
-                        let (r, g, bl) = if is_cursor {
-                            ((r as f64 * 1.3).min(255.0) as u8, (g as f64 * 1.3).min(255.0) as u8, (bl as f64 * 1.3).min(255.0) as u8)
-                        } else {
-                            (r, g, bl)
-                        };
-
-                        // Each dot gets its own speed from its seed — desynchronized
-                        let spin_speed = 0.03 + 0.14 * ((b.seed * 0.7).sin() * 0.5 + 0.5);
-                        let phase = ((state.frame as f64 * spin_speed + b.seed * 13.7) % SPINNER.len() as f64).abs() as usize;
-                        let ch = SPINNER[phase % SPINNER.len()];
-                        spans.push(Span::styled(ch, Style::default().fg(Color::Rgb(r, g, bl))));
-                    } else {
-                        spans.push(Span::raw(" "));
+                        // Blend ripple color
+                        r = r + (ripple.r as f64 - r) * intensity;
+                        g = g + (ripple.g as f64 - g) * intensity;
+                        bl = bl + (ripple.b as f64 - bl) * intensity;
                     }
-                    col += 1;
                 }
+
+                // Cursor highlight
+                if is_cursor {
+                    let (cr, cg, cbl) = freshness_rgb(b.freshness);
+                    r = r + (cr as f64 - r) * 0.6;
+                    g = g + (cg as f64 - g) * 0.6;
+                    bl = bl + (cbl as f64 - bl) * 0.6;
+                }
+
+                // Subtle breathing
+                let breath = 1.0 + 0.03 * (state.frame as f64 * 0.02 + cell_idx as f64 * 0.01).sin();
+                r = (r * breath).min(255.0);
+                g = (g * breath).min(255.0);
+                bl = (bl * breath).min(255.0);
+
+                spans.push(Span::styled("█", Style::default().fg(Color::Rgb(r as u8, g as u8, bl as u8))));
+            } else {
+                spans.push(Span::raw(" "));
             }
-
-            if col < w { spans.push(Span::raw(" ".repeat(w - col))); }
-            lines.push(ratatui::text::Line::from(spans));
         }
 
-        // Gap row between block rows
-        if lines.len() < h {
-            lines.push(ratatui::text::Line::from(" ".repeat(w)));
+        // Right padding
+        let right_pad = w.saturating_sub(pad_x + block_w);
+        if right_pad > 0 {
+            spans.push(Span::raw(" ".repeat(right_pad)));
         }
+
+        lines.push(ratatui::text::Line::from(spans));
     }
 
+    // Bottom padding
     while lines.len() < h {
         lines.push(ratatui::text::Line::from(" ".repeat(w)));
     }
