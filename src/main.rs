@@ -86,6 +86,11 @@ enum Commands {
         #[arg(long)]
         source: Option<String>,
     },
+    /// Test T5 summarizer
+    Summarize {
+        /// Text to summarize
+        text: String,
+    },
 }
 
 fn main() {
@@ -295,6 +300,16 @@ fn main() {
                     }
                 }
                 None => eprintln!("[engram] not relevant enough to store"),
+            }
+        }
+        Commands::Summarize { text } => {
+            eprintln!("[engram] initializing T5 summarizer...");
+            let summarizer = engram::extract::Summarizer::new()
+                .expect("failed to init summarizer");
+            eprintln!("[engram] summarizing...");
+            match summarizer.summarize(&text, 40) {
+                Ok(s) => println!("{s}"),
+                Err(e) => eprintln!("[error] {e}"),
             }
         }
     }

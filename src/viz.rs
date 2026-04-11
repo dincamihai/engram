@@ -84,6 +84,26 @@ struct VizState {
     frame: u64,
     /// Particle trails: recent pixel positions per node for comet effect.
     trails: HashMap<NodeIndex, VecDeque<(usize, usize)>>,
+    /// Cursor position: index into the cluster list (for label highlight).
+    cursor: usize,
+    /// Number of rows in the current multi-column layout (for cursor navigation).
+    layout_rows: usize,
+    /// Number of columns in the current multi-column layout.
+    layout_cols: usize,
+    /// Cached preview for the selected cluster: (cursor_idx, label, summary line, entry previews).
+    preview_cache: Option<(usize, String, String, Vec<String>)>,
+    /// When the cursor last moved (for delayed summarization).
+    cursor_moved_at: Instant,
+    /// The cursor index when it last moved.
+    cursor_at_move: usize,
+    /// Background summarizer: sends (cursor_idx, summary) when ready.
+    summary_rx: Option<std::sync::mpsc::Receiver<(usize, String)>>,
+    /// Sender for background summarizer thread.
+    summary_tx: Option<std::sync::mpsc::Sender<(usize, i64, String, String)>>,
+    /// Whether the summarizer background thread is running.
+    summarizer_running: bool,
+    /// Whether the summarizer model has finished loading.
+    summarizer_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub fn run_viz(db_path: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -258,6 +278,16 @@ fn build_state(tree: &birch::Tree, width: usize, height: usize) -> Result<VizSta
         last_poll: Instant::now(),
         frame: 0,
         trails: HashMap::new(),
+        cursor: 0,
+        layout_rows: 1,
+        layout_cols: 1,
+        preview_cache: None,
+        summary_rx: None,
+        summary_tx: None,
+        summarizer_running: false,
+        summarizer_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cursor_moved_at: Instant::now(),
+        cursor_at_move: 0,
     })
 }
 
@@ -405,6 +435,57 @@ fn run_loop(
     mut state: VizState,
     db_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Start background summarizer thread immediately (downloads model while user browses)
+    {
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<(usize, i64, String, String)>();
+        let (result_tx, result_rx) = std::sync::mpsc::channel::<(usize, String)>();
+        state.summary_tx = Some(request_tx);
+        state.summary_rx = Some(result_rx);
+        state.summarizer_running = true;
+
+        let ready_flag = state.summarizer_ready.clone();
+        std::thread::spawn(move || {
+            // hf-hub may print download progress — redirect only stderr in this thread
+            let saved_stderr = {
+                use std::os::unix::io::AsRawFd;
+                std::fs::File::open("/dev/null").ok().map(|f| {
+                    let saved = unsafe { libc::dup(2) };
+                    unsafe { libc::dup2(f.as_raw_fd(), 2); }
+                    saved
+                })
+            };
+            let summarizer = crate::extract::Summarizer::new().ok();
+            if let Some(saved) = saved_stderr {
+                unsafe { libc::dup2(saved, 2); libc::close(saved); }
+            }
+            ready_flag.store(summarizer.is_some(), std::sync::atomic::Ordering::Relaxed);
+            while let Ok((idx, nid, db, lbl)) = request_rx.recv() {
+                if let Some(ref s) = summarizer {
+                    let text = match birch::Tree::open(&db, crate::embed::DIMENSION, birch::Config::default()) {
+                        Ok(tree) => match tree.node_entries(nid, 300) {
+                            Ok(entries) => {
+                                let combined: String = entries.iter()
+                                    .map(|e| e.content.split_whitespace().collect::<Vec<_>>().join(" "))
+                                    .collect::<Vec<_>>().join(". ");
+                                let input: String = combined.chars().take(400).collect();
+                                match s.summarize(&input, 40) {
+                                    Ok(s) if !s.trim().is_empty() => s,
+                                    Ok(_) => format!("[empty summary] {}", lbl),
+                                    Err(e) => format!("[summarize err: {}]", e),
+                                }
+                            }
+                            Err(e) => format!("[entries err: {}]", e),
+                        },
+                        Err(e) => format!("[tree err: {}]", e),
+                    };
+                    let _ = result_tx.send((idx, text));
+                } else {
+                    let _ = result_tx.send((idx, lbl.replace('-', " ")));
+                }
+            }
+        });
+    }
+
     loop {
         // Advance animations
         tick_animations(&mut state);
@@ -428,7 +509,7 @@ fn run_loop(
 
         // Render
         terminal.draw(|frame| {
-            render_frame(frame, &mut state);
+            render_frame(frame, &mut state, db_path);
         })?;
 
         // Handle events
@@ -455,10 +536,28 @@ fn run_loop(
                         KeyCode::Char('-') => {
                             state.zoom /= 1.2;
                         }
-                        KeyCode::Up => state.pan_y -= 10.0,
-                        KeyCode::Down => state.pan_y += 10.0,
-                        KeyCode::Left => state.pan_x -= 10.0,
-                        KeyCode::Right => state.pan_x += 10.0,
+                        KeyCode::Left => {
+                            let old = state.cursor;
+                            if state.cursor > 0 { state.cursor -= 1; }
+                            if state.cursor != old { state.cursor_moved_at = Instant::now(); state.cursor_at_move = state.cursor; }
+                        }
+                        KeyCode::Right => {
+                            let old = state.cursor;
+                            state.cursor += 1; // clamped in render
+                            if state.cursor != old { state.cursor_moved_at = Instant::now(); state.cursor_at_move = state.cursor; }
+                        }
+                        KeyCode::Up => {
+                            let old = state.cursor;
+                            if state.cursor >= state.layout_cols {
+                                state.cursor -= state.layout_cols;
+                            }
+                            if state.cursor != old { state.cursor_moved_at = Instant::now(); state.cursor_at_move = state.cursor; }
+                        }
+                        KeyCode::Down => {
+                            let old = state.cursor;
+                            state.cursor += state.layout_cols; // clamped in render
+                            if state.cursor != old { state.cursor_moved_at = Instant::now(); state.cursor_at_move = state.cursor; }
+                        }
                         KeyCode::Char('l') => state.show_labels = !state.show_labels,
                         KeyCode::Char('e') => state.show_edges = !state.show_edges,
                         KeyCode::Char(' ') => state.paused = !state.paused,
@@ -486,10 +585,11 @@ fn run_loop(
     }
 }
 
-fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
+fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState, db_path: &str) {
     let area = frame.area();
     let w = area.width as usize;
-    let h = area.height.saturating_sub(1) as usize; // leave 1 row for HUD
+    let preview_lines = 2_usize; // header + summary line
+    let h = area.height.saturating_sub(preview_lines as u16) as usize;
 
     // Collect all entries as blocks from leaf nodes, grouped by cluster
     struct Block { freshness: f32, is_unproven: bool, is_consolidated: bool, anim_color: Option<(u8, u8, u8)>, seed: f64 }
@@ -548,102 +648,294 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState) {
         )
     };
 
-    // Render: one row per cluster — label on left, blocks extending right
-    let label_width = 14_usize; // fixed label column width
-    let _block_cols = w.saturating_sub(label_width + 1); // remaining space for blocks
+    // Render: compact multi-column layout — no labels, cursor selects
 
-    // Group blocks by cluster
-    let mut cluster_blocks: Vec<(String, Vec<&Block>)> = Vec::new();
+    // Group blocks by cluster — (label, birch_node_id, blocks)
+    let mut cluster_blocks: Vec<(String, i64, Vec<&Block>)> = Vec::new();
     let mut bi = 0;
     for &node_idx in &leaf_list {
         let node = &state.graph[node_idx];
         if node.count <= 0 { continue; }
         let count = (node.count) as usize;
-        let label = if node.label.chars().count() > label_width - 1 {
-            let truncated: String = node.label.chars().take(label_width - 3).collect();
-            format!("{}..", truncated)
-        } else {
-            node.label.clone()
-        };
+        let label = node.label.clone();
         let cluster: Vec<&Block> = blocks[bi..bi + count.min(blocks.len() - bi)].iter().collect();
         bi += cluster.len();
-        cluster_blocks.push((label, cluster));
+        cluster_blocks.push((label, node.id, cluster));
     }
+
+    let num_clusters = cluster_blocks.len();
+
+    // Clamp cursor
+    if num_clusters > 0 {
+        state.cursor = state.cursor.min(num_clusters - 1);
+    }
+    let cursor_idx = state.cursor;
+
+    // Flow blocks inline like words in a paragraph.
+    // Each block is ceil(entries/block_h) wide × block_h tall. 1-char gap between blocks.
+    // When the next block doesn't fit, wrap to the next row of blocks.
+    let block_h = 3usize; // rows tall per block
+    let gap = 1usize;
+
+    // Single-dot characters that rotate position — one dot per entry
+    const SPINNER: &[&str] = &["⠁","⠈","⠐","⠠","⢀","⡀","⠄","⠂"];
+
+    // Pre-compute each block's width
+    struct BlockLayout { idx: usize, bw: usize }
+    let mut layouts: Vec<BlockLayout> = Vec::new();
+    for (idx, (_, _, cluster)) in cluster_blocks.iter().enumerate() {
+        let snap = 2usize;
+        let raw_w = ((cluster.len() + block_h - 1) / block_h).max(1);
+        let bw = if raw_w <= snap { raw_w } else { ((raw_w + snap - 1) / snap) * snap };
+        layouts.push(BlockLayout { idx, bw });
+    }
+
+    // Compute total content width to find a good rectangle
+    let total_content: usize = layouts.iter().map(|l| l.bw).sum::<usize>()
+        + if num_clusters > 1 { (num_clusters - 1) * gap } else { 0 };
+
+    // Target: a rectangle that fits in the screen, roughly square-ish in character aspect
+    // Characters are ~2x taller than wide, so ideal ratio is width ≈ 2 * height (in chars)
+    // Try wrap widths from sqrt-based estimate, pick one that fits in h
+    let cell_h = block_h + 1; // block rows + gap row
+    let target_w = {
+        // Start from a width that would make it roughly square visually
+        let approx = ((total_content as f64 * cell_h as f64 * 2.0).sqrt() as usize).max(20);
+        // Clamp to screen
+        approx.min(w)
+    };
+
+    // Pack blocks into rows (word-wrap to target_w)
+    let mut row_groups: Vec<Vec<usize>> = Vec::new();
+    {
+        let mut current_row: Vec<usize> = Vec::new();
+        let mut x = 0usize;
+        for (li, layout) in layouts.iter().enumerate() {
+            let needed = layout.bw + if current_row.is_empty() { 0 } else { gap };
+            if !current_row.is_empty() && x + needed > target_w {
+                row_groups.push(std::mem::take(&mut current_row));
+                x = 0;
+            }
+            if !current_row.is_empty() { x += gap; }
+            x += layout.bw;
+            current_row.push(li);
+        }
+        if !current_row.is_empty() { row_groups.push(current_row); }
+    }
+
+    // Find the actual max row width for centering
+    let actual_w: usize = row_groups.iter().map(|row| {
+        let content: usize = row.iter().map(|&li| layouts[li].bw).sum();
+        let gaps = if row.len() > 1 { (row.len() - 1) * gap } else { 0 };
+        content + gaps
+    }).max().unwrap_or(0);
+
+    // For cursor nav: store how many blocks per visual row
+    state.layout_cols = if !row_groups.is_empty() { row_groups[0].len() } else { 1 };
+    state.layout_rows = row_groups.len();
+
+    // Centering offsets
+    let pad_x = w.saturating_sub(actual_w) / 2;
+    let total_rows = row_groups.len() * cell_h;
+    let pad_y = h.saturating_sub(total_rows) / 2;
 
     let mut lines: Vec<ratatui::text::Line> = Vec::with_capacity(h);
 
-    for (label, cluster) in &cluster_blocks {
-        if lines.len() >= h { break; }
-
-        let mut spans: Vec<Span> = Vec::with_capacity(w);
-        let mut col = 0usize; // track visual column count
-
-        // Label with freshness color of first block
-        let label_color = if let Some(b) = cluster.first() {
-            let (r, g, bl) = freshness_rgb(b.freshness);
-            Color::Rgb(r, g, bl)
-        } else {
-            Color::DarkGray
-        };
-        let padded_label = format!("{:>width$} ", label, width = label_width - 1);
-        col += padded_label.len();
-        spans.push(Span::styled(padded_label, Style::default().fg(label_color)));
-
-        // Blocks
-        for (_i, b) in cluster.iter().enumerate() {
-            if col >= w { break; }
-
-            let (r, g, bl) = if let Some((ar, ag, ab)) = b.anim_color {
-                (ar, ag, ab)
-            } else if b.is_consolidated {
-                let (r, g, bl) = freshness_rgb(b.freshness);
-                ((r as f64 * 0.5) as u8, (g as f64 * 0.5) as u8, (bl as f64 * 0.7) as u8)
-            } else if b.is_unproven {
-                let (r, g, bl) = freshness_rgb(b.freshness);
-                ((r as f64 * 0.4) as u8, (g as f64 * 0.4) as u8, (bl as f64 * 0.4) as u8)
-            } else {
-                freshness_rgb(b.freshness)
-            };
-
-            // Flicker only for new unproven entries — speed decays with age
-            let flicker_speed = 0.02 + 0.12 * b.freshness as f64; // fresh(1.0)=0.14 fast, aging(0.8)=0.12 slower
-            let jitter = (state.frame as f64 * flicker_speed + b.seed).sin();
-            let flicker = if b.is_unproven && b.freshness > 0.8 && jitter > 0.7 { 1.3 } else { 1.0 };
-            let r = (r as f64 * flicker).min(255.0) as u8;
-            let g = (g as f64 * flicker).min(255.0) as u8;
-            let bl = (bl as f64 * flicker).min(255.0) as u8;
-
-            spans.push(Span::styled("█", Style::default().fg(Color::Rgb(r, g, bl))));
-            col += 1;
-        }
-
-        // Fill remaining with spaces
-        while col < w {
-            col += 1;
-            spans.push(Span::raw(" "));
-        }
-
-        lines.push(ratatui::text::Line::from(spans));
+    // Top padding
+    for _ in 0..pad_y.min(h) {
+        lines.push(ratatui::text::Line::from(" ".repeat(w)));
     }
 
-    // Fill remaining rows
+    for row_group in &row_groups {
+        for cy in 0..block_h {
+            if lines.len() >= h { break; }
+            let mut spans: Vec<Span> = Vec::with_capacity(w);
+            let mut col = 0usize;
+
+            // Left padding
+            if pad_x > 0 {
+                spans.push(Span::raw(" ".repeat(pad_x)));
+                col += pad_x;
+            }
+
+            for (gi, &li) in row_group.iter().enumerate() {
+                let layout = &layouts[li];
+                let idx = layout.idx;
+                let bw = layout.bw;
+                let (_, _, ref cluster) = cluster_blocks[idx];
+                let is_cursor = idx == cursor_idx;
+
+                // Gap before block (except first in row)
+                if gi > 0 && col < w {
+                    spans.push(Span::raw(" "));
+                    col += 1;
+                }
+
+                for cx in 0..bw {
+                    if col >= w { break; }
+                    let entry_idx = cy * bw + cx;
+                    if entry_idx < cluster.len() {
+                        let b = cluster[entry_idx];
+
+                        let (r, g, bl) = if let Some((ar, ag, ab)) = b.anim_color {
+                            (ar, ag, ab)
+                        } else if b.is_consolidated {
+                            let (r, g, bl) = freshness_rgb(b.freshness);
+                            ((r as f64 * 0.5) as u8, (g as f64 * 0.5) as u8, (bl as f64 * 0.7) as u8)
+                        } else if b.is_unproven {
+                            let (r, g, bl) = freshness_rgb(b.freshness);
+                            ((r as f64 * 0.4) as u8, (g as f64 * 0.4) as u8, (bl as f64 * 0.4) as u8)
+                        } else {
+                            freshness_rgb(b.freshness)
+                        };
+
+                        let flicker_speed = 0.02 + 0.12 * b.freshness as f64;
+                        let jitter = (state.frame as f64 * flicker_speed + b.seed).sin();
+                        let flicker = if b.is_unproven && b.freshness > 0.8 && jitter > 0.7 { 1.3 } else { 1.0 };
+                        let r = (r as f64 * flicker).min(255.0) as u8;
+                        let g = (g as f64 * flicker).min(255.0) as u8;
+                        let bl = (bl as f64 * flicker).min(255.0) as u8;
+
+                        let (r, g, bl) = if is_cursor {
+                            ((r as f64 * 1.3).min(255.0) as u8, (g as f64 * 1.3).min(255.0) as u8, (bl as f64 * 1.3).min(255.0) as u8)
+                        } else {
+                            (r, g, bl)
+                        };
+
+                        // Each dot gets its own speed from its seed — desynchronized
+                        let spin_speed = 0.03 + 0.14 * ((b.seed * 0.7).sin() * 0.5 + 0.5);
+                        let phase = ((state.frame as f64 * spin_speed + b.seed * 13.7) % SPINNER.len() as f64).abs() as usize;
+                        let ch = SPINNER[phase % SPINNER.len()];
+                        spans.push(Span::styled(ch, Style::default().fg(Color::Rgb(r, g, bl))));
+                    } else {
+                        spans.push(Span::raw(" "));
+                    }
+                    col += 1;
+                }
+            }
+
+            if col < w { spans.push(Span::raw(" ".repeat(w - col))); }
+            lines.push(ratatui::text::Line::from(spans));
+        }
+
+        // Gap row between block rows
+        if lines.len() < h {
+            lines.push(ratatui::text::Line::from(" ".repeat(w)));
+        }
+    }
+
     while lines.len() < h {
         lines.push(ratatui::text::Line::from(" ".repeat(w)));
     }
 
-    frame.render_widget(ratatui::text::Text::from(lines), area);
+    // Render bars area
+    let bars_area = Rect::new(0, 0, area.width, h as u16);
+    frame.render_widget(ratatui::text::Text::from(lines), bars_area);
 
-    // HUD
-    let anim_count = state.animations.values().filter(|a| !matches!(a, NodeAnim::Stable)).count();
-    let status = format!(
-        " entries:{} clusters:{} anims:{} [q]uit [l]abels ",
-        total_entries, leaf_list.len(), anim_count,
-    );
-    let status_widget = ratatui::widgets::Paragraph::new(
-        Span::styled(status, Style::default().fg(Color::DarkGray)),
-    );
-    let bottom = Rect::new(0, area.height.saturating_sub(1), area.width, 1);
-    frame.render_widget(status_widget, bottom);
+    // Preview panel — summarize selected cluster with NLI pipeline
+    if cursor_idx < cluster_blocks.len() {
+        let (ref label, node_id, ref cluster) = cluster_blocks[cursor_idx];
+        let entry_count = cluster.len();
+
+        // Update preview cache if cursor changed or summary not yet generated
+        let has_cache = state.preview_cache.as_ref().map(|(idx, _, _, _)| *idx == cursor_idx).unwrap_or(false);
+        let dwell_time = state.cursor_moved_at.elapsed();
+        let dwell_threshold = Duration::from_millis(800);
+        let has_summary = state.preview_cache.as_ref()
+            .map(|(idx, _, summary, _)| *idx == cursor_idx && !summary.is_empty() && summary != "<requested>")
+            .unwrap_or(false);
+
+        // Phase 1: immediately load entry previews on cursor change
+        if !has_cache {
+            let mut entry_previews = Vec::new();
+            if let Ok(tree) = birch::Tree::open(db_path, crate::embed::DIMENSION, birch::Config::default()) {
+                if let Ok(entries) = tree.node_entries(node_id, 300) {
+                    for e in entries.iter().take(3) {
+                        let oneline: String = e.content.split_whitespace().collect::<Vec<_>>().join(" ");
+                        entry_previews.push(oneline);
+                    }
+                }
+            }
+            // Empty summary — will be filled when dwell threshold is met
+            state.preview_cache = Some((cursor_idx, label.clone(), String::new(), entry_previews));
+        }
+
+        // Phase 2: send summary request to background thread after dwell (only once per cursor pos)
+        let model_ready = state.summarizer_ready.load(std::sync::atomic::Ordering::Relaxed);
+        let already_requested = state.preview_cache.as_ref()
+            .map(|(idx, _, s, _)| *idx == cursor_idx && s == "<requested>")
+            .unwrap_or(false);
+        if !has_summary && !already_requested && dwell_time >= dwell_threshold && model_ready {
+            if let Some(ref tx) = state.summary_tx {
+                let _ = tx.send((cursor_idx, node_id, db_path.to_string(), label.clone()));
+                // Mark as requested
+                if let Some(ref mut cache) = state.preview_cache {
+                    if cache.0 == cursor_idx {
+                        cache.2 = "<requested>".to_string();
+                    }
+                }
+            }
+        }
+
+        // Check for completed summaries from background thread
+        // Only apply if the result matches the CURRENT cursor position
+        if let Some(ref rx) = state.summary_rx {
+            while let Ok((idx, summary)) = rx.try_recv() {
+                if idx == cursor_idx {
+                    if let Some(ref mut cache) = state.preview_cache {
+                        if cache.0 == idx {
+                            cache.2 = summary;
+                        }
+                    }
+                }
+                // else: stale result for a different cursor position — discard
+            }
+        }
+
+        let cached = state.preview_cache.as_ref().unwrap();
+        let cached_label = &cached.1;
+        let summary = &cached.2;
+        let previews = &cached.3;
+
+        // Render preview lines
+        let preview_y = area.height.saturating_sub(preview_lines as u16);
+
+        // Line 1: header
+        let header = format!(
+            " ▸ {} ({} entries)  ─  entries:{} clusters:{} [q]uit [↑↓←→]nav",
+            cached_label, entry_count, total_entries, num_clusters,
+        );
+        let header_widget = ratatui::widgets::Paragraph::new(
+            Span::styled(header, Style::default().fg(Color::White)),
+        );
+        frame.render_widget(header_widget, Rect::new(0, preview_y, area.width, 1));
+
+        // Line 2: summary (or loading status)
+        let model_ready = state.summarizer_ready.load(std::sync::atomic::Ordering::Relaxed);
+        let summary_text = if !model_ready {
+            "<loading summarizer>".to_string()
+        } else if summary.is_empty() || summary == "<requested>" {
+            String::new()
+        } else {
+            summary.clone()
+        };
+        if !summary_text.is_empty() {
+            let truncated: String = summary_text.chars().take(w.saturating_sub(4)).collect();
+            let color = if model_ready { Color::Rgb(180, 200, 220) } else { Color::DarkGray };
+            let summary_widget = ratatui::widgets::Paragraph::new(
+                Span::styled(format!("   {}", truncated), Style::default().fg(color)),
+            );
+            frame.render_widget(summary_widget, Rect::new(0, preview_y + 1, area.width, 1));
+        }
+    } else {
+        // No clusters — just show basic HUD
+        let status = format!(" entries:{} clusters:{} [q]uit", total_entries, num_clusters);
+        let bottom = Rect::new(0, area.height.saturating_sub(1), area.width, 1);
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(Span::styled(status, Style::default().fg(Color::DarkGray))),
+            bottom,
+        );
+    }
 
     // Skip old braille rendering entirely
     return;
