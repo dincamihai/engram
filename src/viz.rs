@@ -51,6 +51,8 @@ enum NodeAnim {
     Growing { progress: f32 },
     /// Node lost entries — red color fading out.
     Shrinking { progress: f32 },
+    /// Memory was accessed/recalled — cyan pulse.
+    Accessed { progress: f32 },
     /// Branch vibration — node shakes slightly (reserved for future use).
     #[allow(dead_code)]
     Vibrating { progress: f32 },
@@ -78,6 +80,8 @@ struct VizState {
     animations: HashMap<NodeIndex, NodeAnim>,
     /// Last known set of BIRCH node IDs (for polling diff).
     known_ids: std::collections::HashSet<i64>,
+    /// Track total access count per node id (for detecting recalls).
+    known_access: HashMap<i64, i64>,
     /// When we last polled the DB for changes.
     last_poll: Instant,
     /// Global frame counter for continuous animations (orbits, breathing).
@@ -260,6 +264,9 @@ fn build_state(tree: &birch::Tree, width: usize, height: usize) -> Result<VizSta
         .map(|idx| (idx, NodeAnim::Stable))
         .collect();
     let known_ids: std::collections::HashSet<i64> = nodes.iter().map(|n| n.id).collect();
+    let known_access: HashMap<i64, i64> = nodes.iter()
+        .map(|n| (n.id, tree.node_total_access(n.id).unwrap_or(0)))
+        .collect();
 
     Ok(VizState {
         graph,
@@ -275,6 +282,7 @@ fn build_state(tree: &birch::Tree, width: usize, height: usize) -> Result<VizSta
         grid_h: height,
         animations,
         known_ids,
+        known_access,
         last_poll: Instant::now(),
         frame: 0,
         trails: HashMap::new(),
@@ -334,6 +342,9 @@ fn poll_changes(state: &mut VizState, db_path: &str) -> Result<(), Box<dyn std::
             }
         }
 
+        // Check for access changes on rebuild
+        state.known_access = new_state.known_access;
+
         return Ok(());
     }
 
@@ -361,6 +372,17 @@ fn poll_changes(state: &mut VizState, db_path: &str) -> Result<(), Box<dyn std::
             state.graph[node_idx].freshness = (1.0 / (1.0 + age_hours / 72.0)) as f32;
             state.graph[node_idx].consolidated = tree.node_consolidated_count(db_node.id).unwrap_or(0);
             state.graph[node_idx].unproven = tree.node_unproven_count(db_node.id).unwrap_or(0);
+
+            // Detect access (recall) — cyan pulse
+            let new_access = tree.node_total_access(db_node.id).unwrap_or(0);
+            let old_access = state.known_access.get(&db_node.id).copied().unwrap_or(0);
+            if new_access > old_access {
+                // Only trigger if not already animating a grow/shrink
+                if matches!(state.animations.get(&node_idx), Some(NodeAnim::Stable) | None) {
+                    state.animations.insert(node_idx, NodeAnim::Accessed { progress: 0.0 });
+                }
+            }
+            state.known_access.insert(db_node.id, new_access);
         }
     }
     state.known_ids = current_ids;
@@ -415,6 +437,12 @@ fn tick_animations(state: &mut VizState) {
             }
             NodeAnim::Shrinking { progress } => {
                 *progress += ANIM_SPEED;
+                if *progress >= 1.0 {
+                    *anim = NodeAnim::Stable;
+                }
+            }
+            NodeAnim::Accessed { progress } => {
+                *progress += ANIM_SPEED * 1.2; // slightly faster than grow/shrink
                 if *progress >= 1.0 {
                     *anim = NodeAnim::Stable;
                 }
@@ -620,6 +648,10 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState, db_path: &str)
                 let p = 0.5 + 0.5 * ((progress * std::f32::consts::PI * 3.0).sin());
                 Some(((255.0 * p) as u8, (40.0 * (1.0 - progress)) as u8, (30.0 * (1.0 - progress)) as u8))
             }
+            Some(NodeAnim::Accessed { progress }) => {
+                let p = 0.5 + 0.5 * ((progress * std::f32::consts::PI * 3.0).sin());
+                Some(((60.0 * p) as u8, (200.0 * p.max(0.3)) as u8, (255.0 * p.max(0.5)) as u8))
+            }
             _ => None,
         };
 
@@ -703,7 +735,7 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState, db_path: &str)
     state.layout_rows = (num_clusters + block_w - 1) / block_w;
 
     // Precompute animation epicenters: center (row, col) and color/intensity for each active cluster
-    struct Ripple { center_row: f64, center_col: f64, r: u8, g: u8, b: u8, progress: f32 }
+    struct Ripple { cluster_idx: usize, center_row: f64, center_col: f64, r: u8, g: u8, b: u8, progress: f32 }
     let mut ripples: Vec<Ripple> = Vec::new();
     {
         let mut cell_offset = 0usize;
@@ -726,9 +758,10 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState, db_path: &str)
                 }) {
                     Some(NodeAnim::Growing { progress }) => *progress,
                     Some(NodeAnim::Shrinking { progress }) => *progress,
+                    Some(NodeAnim::Accessed { progress }) => *progress,
                     _ => 1.0,
                 };
-                ripples.push(Ripple { center_row, center_col, r: ar, g: ag, b: ab, progress });
+                ripples.push(Ripple { cluster_idx: idx, center_row, center_col, r: ar, g: ag, b: ab, progress });
             }
             cell_offset += count;
         }
@@ -769,27 +802,25 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState, db_path: &str)
                 let mut g = (base_g as f64 * (1.0 - mix) + fg as f64 * mix) as f64;
                 let mut bl = (base_bl as f64 * (1.0 - mix) + fbl as f64 * mix) as f64;
 
-                // Apply ripples from all active animations
+                // Apply ripples — only within the affected cluster
                 for ripple in &ripples {
+                    if ripple.cluster_idx != cidx { continue; }
+
                     let dr = row as f64 - ripple.center_row;
                     let dc = col as f64 - ripple.center_col;
                     let dist = (dr * dr + dc * dc).sqrt();
 
-                    // Ripple ring: expanding wavefront based on progress
-                    // Wavefront radius grows with progress, ring width is ~3 cells
-                    let max_radius = 20.0;
+                    // Ripple ring expanding within the cluster region
+                    let max_radius = 12.0;
                     let wavefront = ripple.progress as f64 * max_radius;
                     let ring_dist = (dist - wavefront).abs();
-                    let ring_width = 3.0;
+                    let ring_width = 2.5;
 
                     if ring_dist < ring_width {
-                        // Intensity: strongest at wavefront, fades with distance from ring
                         let ring_intensity = 1.0 - ring_dist / ring_width;
-                        // Also fade out as animation progresses
                         let fade = 1.0 - ripple.progress as f64;
                         let intensity = ring_intensity * fade;
 
-                        // Blend ripple color
                         r = r + (ripple.r as f64 - r) * intensity;
                         g = g + (ripple.g as f64 - g) * intensity;
                         bl = bl + (ripple.b as f64 - bl) * intensity;
@@ -1031,6 +1062,15 @@ fn render_frame(frame: &mut ratatui::Frame, state: &mut VizState, db_path: &str)
                         (255.0 * (1.0 - t * 0.5) * pulse) as u8,
                         (base.g as f32 * (1.0 - t) * 0.3) as u8,
                         (base.b as f32 * (1.0 - t) * 0.2) as u8,
+                    ))
+                }
+                NodeAnim::Accessed { progress } => {
+                    let t = *progress;
+                    let pulse = 0.5 + 0.5 * ((t * std::f32::consts::PI * 3.0).sin());
+                    Some(DotColor::rgb(
+                        (60.0 * pulse) as u8,
+                        (200.0 * pulse.max(0.3)) as u8,
+                        (255.0 * pulse.max(0.5)) as u8,
                     ))
                 }
                 NodeAnim::Vibrating { progress } => {
